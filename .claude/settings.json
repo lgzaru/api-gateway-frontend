@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs ls -1)",
+      "Bash(xargs cat)",
+      "Bash(PGPASSWORD=postgres psql -h localhost -p 5432 -U postgres -d pus_db -c \"SELECT r.code as role, p.code as permission FROM pus_roles r LEFT JOIN pus_role_permissions rp ON rp.role_id = r.id LEFT JOIN pus_permissions p ON p.id = rp.permission_id ORDER BY r.code, p.code LIMIT 60;\")",
+      "Bash(node -e \"const {Drawer} = require\\('antd'\\); console.log\\(Object.keys\\(Drawer\\)\\)\")",
+      "Read(//tmp/**)",
+      "Bash(grep \"\\\\.java$\")",
+      "Bash(grep -E \"\\\\.\\(sql|java\\)$\")",
+      "Bash(bash test-e2e-flow.sh https://c1ed-196-27-109-146.ngrok-free.app admin admin)",
+      "Bash(mvn test *)",
+      "Bash(PGPASSWORD=postgres psql -h localhost -U postgres -d pus_db -c ' *)",
+      "Bash(mkdir -p /tmp/apidoc)",
+      "Bash(npm init *)"
+    ]
+  }
+}
