@@ -16,7 +16,7 @@ import {
   listReplays, triggerReplay,
   listParameters, createParameter, deleteParameter,
   testApi,
-  listTags, createTag, deleteTag,
+  listTags, createTag, updateTag, deleteTag,
 } from '../api/proxy'
 import type {
   ProxyApi, ProxyApiTag, HealthStatus, ProxyEnvironment, RequestLog, Transform, SandboxMock, ReplayRecord, ParameterSource, ParameterType,
@@ -375,6 +375,7 @@ export default function ApiProxy() {
     return () => clearTimeout(t)
   }, [logsSearchInput])
   const [testParams,     setTestParams]     = useState<Record<string, string>>({})
+  const [testParamErrors, setTestParamErrors] = useState<Record<string, boolean>>({})
   const [testResult,     setTestResult]     = useState<{
     success: boolean; statusCode: number; responseTimeMs: number;
     requestBodySent: string | null; responseBody: string | null; errorMessage: string | null
@@ -391,6 +392,10 @@ export default function ApiProxy() {
   const [apisPage, setApisPage] = useState(0)
   const [tagManagerOpen, setTagManagerOpen] = useState(false)
   const [newTagForm, setNewTagForm] = useState({ name: '', description: '', color: '#6366f1' })
+  const [editingTag, setEditingTag] = useState<ProxyApiTag | null>(null)
+  const [editTagForm, setEditTagForm] = useState({ name: '', description: '', color: '#6366f1' })
+  const [tagSearch, setTagSearch] = useState('')
+  const [tagChipsExpanded, setTagChipsExpanded] = useState(false)
 
   const defaultRegister: RegisterFormState = {
     httpMethod: 'POST', internalBaseUrl: '', requestBodyTemplate: '', name: '',
@@ -601,10 +606,18 @@ export default function ApiProxy() {
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['proxy-tags'] }); setNewTagForm({ name: '', description: '', color: '#6366f1' }); toast.success('Tag created') },
     onError: () => toast.error('Tag name already exists or invalid'),
   })
+  const updateTagMutation = useMutation({
+    mutationFn: ({ id, data }: { id: string; data: { name?: string; description?: string; color?: string } }) => updateTag(id, data),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['proxy-tags'] }); setEditingTag(null); toast.success('Tag updated') },
+    onError: () => toast.error('Failed to update tag'),
+  })
   const deleteTagMutation = useMutation({
     mutationFn: (id: string) => deleteTag(id),
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['proxy-tags'] }); toast.success('Tag deleted') },
-    onError: () => toast.error('Failed to delete tag'),
+    onError: (err: unknown) => {
+      const msg = (err as any)?.response?.data?.message
+      toast.error(msg ?? 'Failed to delete tag')
+    },
   })
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -687,6 +700,17 @@ export default function ApiProxy() {
 
   async function runTest() {
     if (!selectedApi) return
+    const requiredParams = (parametersData ?? []).filter(p => p.paramSource === 'CALLER' && p.required)
+    const errors: Record<string, boolean> = {}
+    for (const p of requiredParams) {
+      if (!testParams[p.paramName]?.trim()) errors[p.paramName] = true
+    }
+    if (Object.keys(errors).length > 0) {
+      setTestParamErrors(errors)
+      toast.error('Fill in all required parameters before sending')
+      return
+    }
+    setTestParamErrors({})
     setTestLoading(true); setTestResult(null)
     try {
       const params: Record<string, unknown> = {}
@@ -738,6 +762,7 @@ export default function ApiProxy() {
     if (!regForm.environment) e.environment = 'Required'
     if (!regForm.httpMethod) e.httpMethod = 'Required'
     if (!regForm.healthCheckUrlUnavailable && !regForm.healthCheckUrl.trim()) e.healthCheckUrl = 'Enter a URL or tick "No dedicated health endpoint"'
+    if (regForm.tags.length === 0) e.tags = 'Select at least one tag'
     setRegErrors(e)
     return Object.keys(e).length === 0
   }
@@ -756,6 +781,7 @@ export default function ApiProxy() {
       if (!regForm.publicPath) e.publicPath = 'Required'
       else if (!/^\/proxy\/[a-zA-Z0-9_-]+$/.test(regForm.publicPath)) e.publicPath = 'Must be /proxy/<slug>'
       else if (apis.some(a => a.id !== cloneSourceId && a.publicPath.toLowerCase() === regForm.publicPath.toLowerCase() && a.environment === regForm.environment)) e.publicPath = `This path is already registered in ${regForm.environment}`
+      if (regForm.tags.length === 0) e.tags = 'Select at least one tag'
     } else if (regStep === 'routing') {
       if (!regForm.healthCheckUrlUnavailable && !regForm.healthCheckUrl.trim()) e.healthCheckUrl = 'Enter a URL or tick "No dedicated health endpoint"'
     }
@@ -876,6 +902,9 @@ export default function ApiProxy() {
 
   const apis = apisData?.content ?? []
   const allTags: ProxyApiTag[] = tagsData ?? []
+  const filteredModalTags = allTags.filter(t =>
+    !tagSearch || t.name.toLowerCase().includes(tagSearch.toLowerCase()) || (t.description ?? '').toLowerCase().includes(tagSearch.toLowerCase())
+  )
   const filteredApis = apis.filter(api => {
     const matchesEnv    = activeEnvTab === 'all' || api.environment === activeEnvTab
     const matchesSearch = !sidebarSearch || api.name.toLowerCase().includes(sidebarSearch.toLowerCase()) || api.publicPath.toLowerCase().includes(sidebarSearch.toLowerCase())
@@ -1351,8 +1380,8 @@ export default function ApiProxy() {
                         className="pus-input"
                         placeholder={`Enter ${p.paramName}`}
                         value={testParams[p.paramName] ?? ''}
-                        onChange={e => setTestParams(prev => ({ ...prev, [p.paramName]: e.target.value }))}
-                        style={{ fontFamily: 'monospace', width: '100%', boxSizing: 'border-box' }}
+                        onChange={e => { setTestParams(prev => ({ ...prev, [p.paramName]: e.target.value })); if (testParamErrors[p.paramName]) setTestParamErrors(prev => ({ ...prev, [p.paramName]: false })) }}
+                        style={{ fontFamily: 'monospace', width: '100%', boxSizing: 'border-box', ...(testParamErrors[p.paramName] ? { borderColor: 'var(--red)', outline: '1px solid var(--red)' } : {}) }}
                       />
                     </div>
                   ))}
@@ -2398,33 +2427,49 @@ export default function ApiProxy() {
           </div>
 
           {/* Tag filter chips */}
-          {allTags.length > 0 && (
-            <div style={{ padding: '6px 10px', borderBottom: '1px solid var(--border)', background: headerBg, flexShrink: 0, display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
-              <button
-                onClick={() => setActiveTagFilter(null)}
-                style={{ fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 10, border: `1px solid ${!activeTagFilter ? ACCENT : 'var(--border)'}`, background: !activeTagFilter ? `${ACCENT}18` : 'transparent', color: !activeTagFilter ? ACCENT : 'var(--txt-3)', cursor: 'pointer' }}
-              >
-                All
-              </button>
-              {allTags.map(tag => (
+          {allTags.length > 0 && (() => {
+            const TAG_LIMIT = 8
+            const activeIdx = activeTagFilter ? allTags.findIndex(t => t.name === activeTagFilter) : -1
+            const forceExpand = activeIdx >= TAG_LIMIT
+            const expanded = tagChipsExpanded || forceExpand
+            const visible = expanded ? allTags : allTags.slice(0, TAG_LIMIT)
+            const hiddenCount = allTags.length - TAG_LIMIT
+            return (
+              <div style={{ padding: '6px 10px', borderBottom: '1px solid var(--border)', background: headerBg, flexShrink: 0, display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
                 <button
-                  key={tag.id}
-                  onClick={() => { setActiveTagFilter(activeTagFilter === tag.name ? null : tag.name); setApisPage(0) }}
-                  title={tag.description ?? tag.name}
-                  style={{ fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 10, border: `1px solid ${activeTagFilter === tag.name ? tag.color : 'var(--border)'}`, background: activeTagFilter === tag.name ? `${tag.color}20` : 'transparent', color: activeTagFilter === tag.name ? tag.color : 'var(--txt-3)', cursor: 'pointer', transition: 'all 0.15s' }}
+                  onClick={() => setActiveTagFilter(null)}
+                  style={{ fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 10, border: `1px solid ${!activeTagFilter ? ACCENT : 'var(--border)'}`, background: !activeTagFilter ? `${ACCENT}18` : 'transparent', color: !activeTagFilter ? ACCENT : 'var(--txt-3)', cursor: 'pointer' }}
                 >
-                  {tag.name}
+                  All
                 </button>
-              ))}
-              <button
-                onClick={() => setTagManagerOpen(true)}
-                title="Manage tags"
-                style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--txt-3)', display: 'flex', padding: 2 }}
-              >
-                <Tags size={13} />
-              </button>
-            </div>
-          )}
+                {visible.map(tag => (
+                  <button
+                    key={tag.id}
+                    onClick={() => { setActiveTagFilter(activeTagFilter === tag.name ? null : tag.name); setApisPage(0) }}
+                    title={tag.description ?? tag.name}
+                    style={{ fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 10, border: `1px solid ${activeTagFilter === tag.name ? tag.color : 'var(--border)'}`, background: activeTagFilter === tag.name ? `${tag.color}20` : 'transparent', color: activeTagFilter === tag.name ? tag.color : 'var(--txt-3)', cursor: 'pointer', transition: 'all 0.15s' }}
+                  >
+                    {tag.name}
+                  </button>
+                ))}
+                {hiddenCount > 0 && (
+                  <button
+                    onClick={() => setTagChipsExpanded(e => !e)}
+                    style={{ fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 10, border: '1px dashed var(--border)', background: 'transparent', color: 'var(--txt-3)', cursor: 'pointer' }}
+                  >
+                    {expanded ? '− Less' : `+${hiddenCount} more`}
+                  </button>
+                )}
+                <button
+                  onClick={() => setTagManagerOpen(true)}
+                  title="Manage tags"
+                  style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--txt-3)', display: 'flex', padding: 2 }}
+                >
+                  <Tags size={13} />
+                </button>
+              </div>
+            )
+          })()}
 
           {/* Tag manager trigger when no tags yet */}
           {allTags.length === 0 && (
@@ -2467,7 +2512,7 @@ export default function ApiProxy() {
                   onDrop={() => handleDrop(api.id)}
                   onClick={() => { setSelectedApi(api); setDetailTab('overview'); setTestResult(null); setTestParams({}); setLogsPage(0); setLogsSearchInput(''); setLogsSearch(''); setReplaysPage(0) }}
                   style={{
-                    padding: '11px 14px 11px 10px', cursor: 'pointer', transition: 'background 0.1s',
+                    padding: '10px 12px 10px 8px', cursor: 'pointer', transition: 'background 0.1s',
                     background: isDragOver ? `${ACCENT}14` : active ? (isDark ? `${ACCENT}18` : `${ACCENT}0c`) : 'transparent',
                     borderLeft: `3px solid ${isDragOver ? ACCENT : active ? ACCENT : 'transparent'}`,
                     borderTop: isDragOver ? `2px solid ${ACCENT}` : '2px solid transparent',
@@ -2477,72 +2522,63 @@ export default function ApiProxy() {
                   }}
                 >
                   {/* Drag handle */}
-                  <div
-                    style={{ color: 'var(--txt-4)', paddingTop: 2, flexShrink: 0, cursor: 'grab' }}
-                    title="Drag to reorder"
-                    onClick={e => e.stopPropagation()}
-                  >
-                    <GripVertical size={12} />
+                  <div style={{ color: 'var(--txt-4)', paddingTop: 3, flexShrink: 0, cursor: 'grab' }} title="Drag to reorder" onClick={e => e.stopPropagation()}>
+                    <GripVertical size={11} />
                   </div>
 
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                  {/* Row 1: name + action icons only */}
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0, flex: 1 }}>
-                      <HealthDot status={api.healthStatus} />
-                      <span
-                        title={api.name}
-                        style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-                      >
-                        {api.name}
-                      </span>
+                  <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
+
+                    {/* Row 1: health dot + name + actions */}
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 4 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 }}>
+                        <HealthDot status={api.healthStatus} />
+                        <span title={api.name} style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {api.name}
+                        </span>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 1, flexShrink: 0 }} onClick={e => e.stopPropagation()}>
+                        {!api.builtIn && <Btn variant="ghost" size="sm" icon={<Pencil size={11} />} iconOnly onClick={() => openEdit(api)} style={{ height: 20, padding: '0 4px', color: 'var(--txt-3)' }} />}
+                        <Btn variant="ghost" size="sm" icon={<CopyPlus size={11} />} iconOnly onClick={() => openClone(api)} style={{ height: 20, padding: '0 4px', color: 'var(--txt-3)' }} />
+                        {api.builtIn
+                          ? <span title="Built-in APIs cannot be deleted" style={{ display: 'flex', alignItems: 'center', padding: '0 4px', color: 'var(--txt-4)', cursor: 'not-allowed' }}><Lock size={11} /></span>
+                          : <Confirm title="Remove this API?" danger onConfirm={() => deleteMutation.mutate(api.id)}><Btn variant="danger" size="sm" icon={<Trash2 size={11} />} iconOnly style={{ height: 20, padding: '0 4px' }} /></Confirm>
+                        }
+                      </div>
                     </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexShrink: 0, marginLeft: 4 }} onClick={e => e.stopPropagation()}>
-                      {!api.builtIn && <Btn variant="ghost" size="sm" icon={<Pencil size={11} />} iconOnly onClick={() => openEdit(api)} style={{ height: 20, padding: '0 4px', color: 'var(--txt-3)' }} />}
-                      <Btn variant="ghost" size="sm" icon={<CopyPlus size={11} />} iconOnly onClick={() => openClone(api)} style={{ height: 20, padding: '0 4px', color: 'var(--txt-3)' }} />
-                      {api.builtIn
-                        ? <span title="Built-in APIs cannot be deleted" style={{ display: 'flex', alignItems: 'center', padding: '0 4px', color: 'var(--txt-4)', cursor: 'not-allowed' }}><Lock size={11} /></span>
-                        : (
-                          <Confirm title="Remove this API?" danger onConfirm={() => deleteMutation.mutate(api.id)}>
-                            <Btn variant="danger" size="sm" icon={<Trash2 size={11} />} iconOnly style={{ height: 20, padding: '0 4px' }} />
-                          </Confirm>
-                        )
+
+                    {/* Row 2: method + path */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                      {api.httpMethod && <MethodChip method={api.httpMethod} />}
+                      <span style={{ fontSize: 11, color: 'var(--txt-3)', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                        {api.publicPath}
+                      </span>
+                      {api.exposedDomain && <span title="Kong gateway configured" style={{ display: 'inline-flex', flexShrink: 0 }}><Globe size={9} color={ACCENT} /></span>}
+                    </div>
+
+                    {/* Row 3: status badges — fixed single line, no wrap */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 3, flexWrap: 'nowrap', overflow: 'hidden' }}>
+                      {api.builtIn && <Tag color="accent" style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}>BUILT-IN</Tag>}
+                      <Tag color={ENV_TAG_COLOR[api.environment] ?? 'muted'} style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}>{api.environment}</Tag>
+                      <Tag color={api.status === 'ACTIVE' ? 'green' : 'muted'} style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}>
+                        {api.status === 'ACTIVE' ? 'Active' : 'Inactive'}
+                      </Tag>
+                      {api.authRequired
+                        ? <Tag color="blue" style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}><Lock size={8} style={{ display: 'inline', marginRight: 2 }} />Auth</Tag>
+                        : <Tag color="muted" style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}><Unlock size={8} style={{ display: 'inline', marginRight: 2 }} />Open</Tag>
                       }
+                      <Tag color={HEALTH_TAG_COLOR[api.healthStatus]} style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}>{api.healthStatus}</Tag>
                     </div>
-                  </div>
 
-                  {/* Row 2: method + path */}
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                    {api.httpMethod && <MethodChip method={api.httpMethod} />}
-                    <span style={{ fontSize: 11, color: 'var(--txt-3)', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {api.publicPath}
-                    </span>
-                    {api.exposedDomain && (
-                      <span title="Kong gateway configured" style={{ display: 'inline-flex', flexShrink: 0 }}>
-                        <Globe size={9} color={ACCENT} />
-                      </span>
+                    {/* Row 4: API tags — only rendered when present */}
+                    {apiTags.length > 0 && (
+                      <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
+                        {apiTags.map(t => (
+                          <span key={t.id} style={{ fontSize: 9, fontWeight: 700, padding: '1px 6px', borderRadius: 10, background: `${t.color}20`, color: t.color, border: `1px solid ${t.color}40`, lineHeight: '14px', whiteSpace: 'nowrap' }}>{t.name}</span>
+                        ))}
+                      </div>
                     )}
-                  </div>
 
-                  {/* Row 3: env/built-in + status + tag chips */}
-                  <div style={{ display: 'flex', gap: 4, marginTop: 5, flexWrap: 'wrap', alignItems: 'center' }}>
-                    {api.builtIn && (
-                      <Tag color="accent" style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0 }}>BUILT-IN</Tag>
-                    )}
-                    <Tag color={ENV_TAG_COLOR[api.environment] ?? 'muted'} style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0 }}>{api.environment}</Tag>
-                    <Tag color={api.status === 'ACTIVE' ? 'green' : 'muted'} style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0 }}>
-                      {api.status === 'ACTIVE' ? 'Active' : 'Inactive'}
-                    </Tag>
-                    {api.authRequired
-                      ? <Tag color="blue" style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0 }}><Lock size={8} style={{ display: 'inline', marginRight: 2 }} />Auth</Tag>
-                      : <Tag color="muted" style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0 }}><Unlock size={8} style={{ display: 'inline', marginRight: 2 }} />Open</Tag>
-                    }
-                    <Tag color={HEALTH_TAG_COLOR[api.healthStatus]} style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0 }}>{api.healthStatus}</Tag>
-                    {apiTags.map(t => (
-                      <span key={t.id} style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 10, background: `${t.color}20`, color: t.color, border: `1px solid ${t.color}40`, lineHeight: '14px' }}>{t.name}</span>
-                    ))}
                   </div>
-                  </div>{/* end flex:1 content wrapper */}
                 </div>
               )
             })}
@@ -2875,7 +2911,7 @@ export default function ApiProxy() {
                 style={{ width: '100%' }} />
             </Field>
 
-            <Field label="Tags" hint="Group this API by assigning one or more tags">
+            <Field label="Tags" hint="Required — group this API by assigning one or more tags" error={regErrors.tags}>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                 {allTags.map(tag => {
                   const selected = regForm.tags.includes(tag.name)
@@ -3152,12 +3188,12 @@ export default function ApiProxy() {
       {/* ── Tag Manager Modal ─────────────────────────────────────────────────── */}
       <Modal
         open={tagManagerOpen}
-        onClose={() => setTagManagerOpen(false)}
-        title={<div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><Tags size={15} /><span>Manage Tags</span></div>}
-        width={480}
-        footer={<Btn variant="ghost" size="sm" onClick={() => setTagManagerOpen(false)}>Close</Btn>}
+        onClose={() => { setTagManagerOpen(false); setTagSearch(''); setEditingTag(null) }}
+        title={<div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><Tags size={15} /><span>Manage Tags</span>{allTags.length > 0 && <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--txt-3)', background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 10, padding: '1px 7px' }}>{allTags.length}</span>}</div>}
+        width={520}
+        footer={<Btn variant="ghost" size="sm" onClick={() => { setTagManagerOpen(false); setTagSearch(''); setEditingTag(null) }}>Close</Btn>}
       >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           {/* Create new tag */}
           <div style={{ padding: '12px 14px', background: 'var(--surface-2)', borderRadius: 8, border: '1px solid var(--border)' }}>
             <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--txt-1)', marginBottom: 10 }}>Create new tag</div>
@@ -3181,21 +3217,70 @@ export default function ApiProxy() {
           </div>
 
           {/* Existing tags */}
-          {allTags.length === 0 ? (
+          {allTags.length === 0 && (
             <div style={{ textAlign: 'center', color: 'var(--txt-3)', fontSize: 12, padding: '8px 0' }}>No tags yet. Create one above.</div>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              {allTags.map(tag => (
-                <div key={tag.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--surface-1)' }}>
-                  <div style={{ width: 12, height: 12, borderRadius: '50%', background: tag.color, flexShrink: 0 }} />
-                  <span style={{ fontSize: 12, fontWeight: 700, color: tag.color, minWidth: 80 }}>{tag.name}</span>
-                  <span style={{ fontSize: 11, color: 'var(--txt-3)', flex: 1 }}>{tag.description ?? '—'}</span>
-                  <span style={{ fontSize: 10, color: 'var(--txt-3)' }}>{apis.filter(a => (a.tags ?? []).includes(tag.name)).length} APIs</span>
-                  <Confirm title={`Delete tag "${tag.name}"?`} danger onConfirm={() => deleteTagMutation.mutate(tag.id)}>
-                    <Btn variant="danger" size="sm" icon={<Trash2 size={11} />} iconOnly />
-                  </Confirm>
-                </div>
-              ))}
+          )}
+          {allTags.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {/* Search */}
+              <div style={{ position: 'relative' }}>
+                <Search size={13} style={{ position: 'absolute', left: 9, top: '50%', transform: 'translateY(-50%)', color: 'var(--txt-3)', pointerEvents: 'none' }} />
+                <input
+                  value={tagSearch}
+                  onChange={e => { setTagSearch(e.target.value); setEditingTag(null) }}
+                  placeholder="Search tags…"
+                  style={{ width: '100%', paddingLeft: 30, paddingRight: 10, paddingTop: 7, paddingBottom: 7, fontSize: 12, borderRadius: 7, border: '1px solid var(--border)', background: 'var(--surface-1)', color: 'var(--txt-1)', outline: 'none', boxSizing: 'border-box' }}
+                />
+                {tagSearch && (
+                  <button onClick={() => setTagSearch('')} style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--txt-3)', display: 'flex', padding: 0 }}>
+                    <X size={12} />
+                  </button>
+                )}
+              </div>
+              {/* Scrollable list */}
+              <div style={{ maxHeight: 380, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 5, paddingRight: 2 }}>
+                {filteredModalTags.length === 0 && (
+                  <div style={{ textAlign: 'center', color: 'var(--txt-3)', fontSize: 12, padding: '16px 0' }}>No tags match "{tagSearch}"</div>
+                )}
+                {filteredModalTags.map(tag => (
+                  <div key={tag.id}>
+                    {editingTag?.id === tag.id ? (
+                      <div style={{ padding: '10px 12px', borderRadius: 8, border: '1px solid var(--accent)', background: 'var(--surface-2)' }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 8 }}>
+                          <Inp label="Name" value={editTagForm.name} onChangeValue={v => setEditTagForm(f => ({ ...f, name: v }))} />
+                          <div>
+                            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--txt-2)', marginBottom: 4 }}>Color</div>
+                            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                              {['#6366f1','#3b82f6','#22c55e','#f97316','#ef4444','#a855f7','#14b8a6','#f59e0b'].map(c => (
+                                <button key={c} onClick={() => setEditTagForm(f => ({ ...f, color: c }))} style={{ width: 22, height: 22, borderRadius: '50%', background: c, border: editTagForm.color === c ? '2px solid var(--txt-1)' : '2px solid transparent', cursor: 'pointer', outline: 'none' }} />
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                        <Inp label="Description" value={editTagForm.description} onChangeValue={v => setEditTagForm(f => ({ ...f, description: v }))} placeholder="What does this tag represent?" />
+                        <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+                          <Btn variant="primary" size="sm" loading={updateTagMutation.isPending}
+                            onClick={() => { if (editTagForm.name.trim()) updateTagMutation.mutate({ id: tag.id, data: { name: editTagForm.name.trim(), description: editTagForm.description.trim() || undefined, color: editTagForm.color } }) }}>
+                            Save
+                          </Btn>
+                          <Btn variant="ghost" size="sm" onClick={() => setEditingTag(null)}>Cancel</Btn>
+                        </div>
+                      </div>
+                    ) : (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--surface-1)' }}>
+                        <div style={{ width: 12, height: 12, borderRadius: '50%', background: tag.color, flexShrink: 0 }} />
+                        <span style={{ fontSize: 12, fontWeight: 700, color: tag.color, minWidth: 80 }}>{tag.name}</span>
+                        <span style={{ fontSize: 11, color: 'var(--txt-3)', flex: 1 }}>{tag.description ?? '—'}</span>
+                        <span style={{ fontSize: 10, color: 'var(--txt-3)' }}>{apis.filter(a => (a.tags ?? []).includes(tag.name)).length} APIs</span>
+                        <Btn variant="ghost" size="sm" icon={<Pencil size={11} />} iconOnly onClick={() => { setEditingTag(tag); setEditTagForm({ name: tag.name, description: tag.description ?? '', color: tag.color }) }} />
+                        <Confirm title={`Delete tag "${tag.name}"?`} danger onConfirm={() => deleteTagMutation.mutate(tag.id)}>
+                          <Btn variant="danger" size="sm" icon={<Trash2 size={11} />} iconOnly />
+                        </Confirm>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </div>

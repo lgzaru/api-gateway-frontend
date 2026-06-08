@@ -336,5 +336,8 @@ export const listTags = (): Promise<AxiosResponse<ProxyApiTag[]>> =>
 export const createTag = (data: { name: string; description?: string; color?: string }): Promise<AxiosResponse<ProxyApiTag>> =>
   client.post('/tag/proxy/tags', data)
 
+export const updateTag = (id: string, data: { name?: string; description?: string; color?: string }): Promise<AxiosResponse<ProxyApiTag>> =>
+  client.patch(`/tag/proxy/tags/${id}`, data)
+
 export const deleteTag = (id: string): Promise<AxiosResponse<void>> =>
   client.delete(`/tag/proxy/tags/${id}`)

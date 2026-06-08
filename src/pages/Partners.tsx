@@ -286,8 +286,9 @@ export default function Partners() {
 
   const updateMutation = useMutation({
     mutationFn: ({ id, data }: { id: string; data: Parameters<typeof updatePartner>[1] }) => updatePartner(id, data),
-    onSuccess: () => {
+    onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ['partners'] })
+      setSelected(res.data)
       setDrawerOpen(false)
       setEditing(null)
       toast.success('Partner updated')
@@ -1333,10 +1334,26 @@ export default function Partners() {
             onClick={() => {
               if (!validatePartner()) return
               if (editing) {
-                const { shortCode: _sc, ...rest } = partnerForm
-                updateMutation.mutate({ id: editing.id, data: rest as Parameters<typeof updatePartner>[1] })
+                updateMutation.mutate({
+                  id: editing.id,
+                  data: {
+                    name: partnerForm.name.trim(),
+                    email: partnerForm.email.trim(),
+                    phone: partnerForm.phone.trim() || undefined,
+                    type: partnerForm.type as Parameters<typeof updatePartner>[1]['type'],
+                    status: partnerForm.status as Parameters<typeof updatePartner>[1]['status'],
+                    contractRef: partnerForm.contractRef.trim() || undefined,
+                  },
+                })
               } else {
-                createMutation.mutate(partnerForm as Parameters<typeof createPartner>[0])
+                createMutation.mutate({
+                  name: partnerForm.name.trim(),
+                  shortCode: partnerForm.shortCode.trim(),
+                  email: partnerForm.email.trim(),
+                  phone: partnerForm.phone.trim() || undefined,
+                  type: partnerForm.type as Parameters<typeof createPartner>[0]['type'],
+                  contractRef: partnerForm.contractRef.trim() || undefined,
+                })
               }
             }}
           >
@@ -1344,40 +1361,136 @@ export default function Partners() {
           </Btn>
         }
       >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <Inp label="Name *" value={partnerForm.name} onChangeValue={v => setPartnerForm(f => ({ ...f, name: v }))} error={partnerErrors.name} placeholder="e.g. Acme Bank Ltd" />
-          {!editing && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+
+          {/* Identity preview */}
+          {(partnerForm.name || partnerForm.type) && (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 12,
+              padding: '12px 14px', marginBottom: 16,
+              background: 'var(--surface-2)', border: '1px solid var(--border)',
+              borderRadius: 10,
+            }}>
+              <div style={{
+                width: 40, height: 40, borderRadius: 11, flexShrink: 0,
+                background: partnerForm.name ? avatarColor(partnerForm.name) : 'var(--border)',
+                color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 14, fontWeight: 700, userSelect: 'none',
+              }}>
+                {partnerForm.name ? initials(partnerForm.name) : '?'}
+              </div>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: partnerForm.name ? 'var(--txt-1)' : 'var(--txt-3)', marginBottom: 3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {partnerForm.name || 'Partner name'}
+                </div>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  {partnerForm.shortCode && (
+                    <span style={{ fontSize: 10, fontFamily: 'monospace', background: 'var(--surface)', border: '1px solid var(--border)', padding: '1px 6px', borderRadius: 4, color: 'var(--txt-2)' }}>{partnerForm.shortCode}</span>
+                  )}
+                  {partnerForm.type && (
+                    <Tag color={partnerTypeColor(partnerForm.type)} style={{ fontSize: 10 }}>{partnerForm.type}</Tag>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Section: Identity */}
+          <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--txt-3)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Organisation</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 16 }}>
             <Inp
-              label="Short Code *"
-              value={partnerForm.shortCode}
-              onChangeValue={v => setPartnerForm(f => ({ ...f, shortCode: v }))}
-              error={partnerErrors.shortCode}
-              placeholder="e.g. ACME_BANK"
+              label="Name *"
+              value={partnerForm.name}
+              onChangeValue={v => setPartnerForm(f => ({ ...f, name: v }))}
+              error={partnerErrors.name}
+              placeholder="e.g. Zimbabwe Revenue Authority"
             />
-          )}
-          <Inp label="Email *" type="email" value={partnerForm.email} onChangeValue={v => setPartnerForm(f => ({ ...f, email: v }))} error={partnerErrors.email} placeholder="contact@partner.com" />
-          <Inp label="Phone" value={partnerForm.phone} onChangeValue={v => setPartnerForm(f => ({ ...f, phone: v }))} placeholder="+1 555 000 1234" />
-          <Sel
-            label="Type *"
-            options={[
-              { value: 'MINISTRY',   label: 'Ministry' },
-              { value: 'DEPARTMENT', label: 'Department' },
-              { value: 'AGENCY',     label: 'Agency' },
-              { value: 'PARASTATAL', label: 'Parastatal' },
-            ]}
-            value={partnerForm.type}
-            onChangeValue={v => setPartnerForm(f => ({ ...f, type: v }))}
-            error={partnerErrors.type}
-          />
-          {editing && (
+            {editing ? (
+              <div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--txt-2)', marginBottom: 5 }}>Short Code</div>
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: 8,
+                  padding: '8px 12px', borderRadius: 8,
+                  background: 'var(--surface-2)', border: '1px solid var(--border)',
+                }}>
+                  <span style={{ fontFamily: 'monospace', fontSize: 13, fontWeight: 700, color: 'var(--txt-1)', flex: 1 }}>{editing.shortCode}</span>
+                  <span style={{ fontSize: 10, color: 'var(--txt-3)', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 4, padding: '2px 7px' }}>read-only</span>
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--txt-3)', marginTop: 4 }}>Cannot be changed after creation.</div>
+              </div>
+            ) : (
+              <div>
+                <Inp
+                  label="Short Code *"
+                  value={partnerForm.shortCode}
+                  onChangeValue={v => setPartnerForm(f => ({ ...f, shortCode: v.toUpperCase() }))}
+                  error={partnerErrors.shortCode}
+                  placeholder="e.g. ZIMRA"
+                />
+                <div style={{ fontSize: 11, color: 'var(--txt-3)', marginTop: 4, lineHeight: 1.5 }}>
+                  Unique identifier — uppercase letters, numbers and underscores only (2–12 chars). Cannot be changed after creation.
+                </div>
+              </div>
+            )}
             <Sel
-              label="Status"
-              options={['ACTIVE','INACTIVE','SUSPENDED'].map(k => ({ value: k, label: k }))}
-              value={partnerForm.status}
-              onChangeValue={v => setPartnerForm(f => ({ ...f, status: v }))}
+              label="Type *"
+              options={[
+                { value: 'MINISTRY',   label: 'Ministry — Cabinet-level government ministry' },
+                { value: 'DEPARTMENT', label: 'Department — Division within a ministry' },
+                { value: 'AGENCY',     label: 'Agency — Statutory or regulatory body' },
+                { value: 'PARASTATAL', label: 'Parastatal — State-owned enterprise' },
+              ]}
+              value={partnerForm.type}
+              onChangeValue={v => setPartnerForm(f => ({ ...f, type: v }))}
+              error={partnerErrors.type}
             />
-          )}
-          <Inp label="Contract Ref" value={partnerForm.contractRef} onChangeValue={v => setPartnerForm(f => ({ ...f, contractRef: v }))} placeholder="e.g. MSA-2025-001" />
+            {editing && (
+              <Sel
+                label="Status"
+                options={['ACTIVE','INACTIVE','SUSPENDED'].map(k => ({ value: k, label: k }))}
+                value={partnerForm.status}
+                onChangeValue={v => setPartnerForm(f => ({ ...f, status: v }))}
+              />
+            )}
+          </div>
+
+          {/* Divider */}
+          <div style={{ height: 1, background: 'var(--divider)', marginBottom: 16 }} />
+
+          {/* Section: Contact */}
+          <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--txt-3)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Contact</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 16 }}>
+            <Inp
+              label="Email *"
+              type="email"
+              value={partnerForm.email}
+              onChangeValue={v => setPartnerForm(f => ({ ...f, email: v }))}
+              error={partnerErrors.email}
+              placeholder="e.g. ops@zimra.co.zw"
+            />
+            <Inp
+              label="Phone"
+              value={partnerForm.phone}
+              onChangeValue={v => setPartnerForm(f => ({ ...f, phone: v }))}
+              placeholder="e.g. +263 242 000 000"
+            />
+          </div>
+
+          {/* Divider */}
+          <div style={{ height: 1, background: 'var(--divider)', marginBottom: 16 }} />
+
+          {/* Section: Contract */}
+          <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--txt-3)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Contract</div>
+          <Inp
+            label="Contract Ref"
+            value={partnerForm.contractRef}
+            onChangeValue={v => setPartnerForm(f => ({ ...f, contractRef: v }))}
+            placeholder="e.g. GOZ-MSA-2026-001"
+          />
+          <div style={{ fontSize: 11, color: 'var(--txt-3)', marginTop: 4, lineHeight: 1.5 }}>
+            Reference number of the Master Service Agreement or onboarding contract.
+          </div>
+
         </div>
       </Drawer>
 

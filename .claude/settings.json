@@ -12,7 +12,9 @@
       "Bash(mvn test *)",
       "Bash(PGPASSWORD=postgres psql -h localhost -U postgres -d pus_db -c ' *)",
       "Bash(mkdir -p /tmp/apidoc)",
-      "Bash(npm init *)"
+      "Bash(npm init *)",
+      "Bash(python3)",
+      "Bash(node gen-docx.js)"
     ]
   }
 }

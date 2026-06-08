@@ -468,12 +468,20 @@ function MetricsTable({ rows }: { rows: ApiMetrics[] }) {
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 
+const ENV_OPTS = [
+  { label: 'All',     value: undefined,    color: '#818cf8' },
+  { label: 'Sandbox', value: 'sandbox',    color: '#7c3aed' },
+  { label: 'Dev',     value: 'dev',        color: '#059669' },
+  { label: 'Prod',    value: 'prod',       color: '#0891b2' },
+] as const
+
 export default function Dashboard() {
   const { user, can } = useAuth()
   const { isDark }    = useTheme()
   const navigate      = useNavigate()
   const [time, setTime] = useState(() => new Date())
   const offsetRef = useRef(0)
+  const [envFilter, setEnvFilter] = useState<string | undefined>(undefined)
 
   // Sync offset from server on mount and every 5 minutes
   useEffect(() => {
@@ -506,8 +514,8 @@ export default function Dashboard() {
   // ── Queries ───────────────────────────────────────────────────────────────
 
   const { data: proxyPage } = useQuery({
-    queryKey: ['dash-proxy'], staleTime: 30_000,
-    queryFn:  () => listApis({ page: 0, size: 1 }),
+    queryKey: ['dash-proxy', envFilter], staleTime: 30_000,
+    queryFn:  () => listApis({ page: 0, size: 1, environment: envFilter }),
     select:   r  => r.data,
   })
   const proxyTotal = proxyPage?.totalElements ?? 0
@@ -519,8 +527,8 @@ export default function Dashboard() {
   })
 
   const { data: metricsData } = useQuery({
-    queryKey: ['dash-metrics'], staleTime: 30_000,
-    queryFn:  () => getDashboardMetrics(),
+    queryKey: ['dash-metrics', envFilter], staleTime: 30_000,
+    queryFn:  () => getDashboardMetrics(envFilter ? { environment: envFilter } : undefined),
     select:   r => r.data,
   })
   const totalRequests    = metricsData?.reduce((s, m) => s + m.requestsLast24h, 0) ?? 0
@@ -612,6 +620,41 @@ export default function Dashboard() {
         </div>
       </div>
 
+      {/* ── Environment filter ────────────────────────────────────────────── */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+        <span style={{ fontSize: 10, color: 'var(--txt-3)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px', flexShrink: 0 }}>Environment</span>
+        <div style={{ display: 'flex', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, padding: 3, gap: 3 }}>
+          {ENV_OPTS.map(opt => {
+            const active = envFilter === opt.value
+            return (
+              <button
+                key={String(opt.value)}
+                onClick={() => setEnvFilter(opt.value)}
+                style={{
+                  padding: '4px 12px', borderRadius: 6, border: active ? `1px solid ${opt.color}50` : '1px solid transparent',
+                  background: active ? `${opt.color}18` : 'transparent',
+                  color: active ? opt.color : 'var(--txt-3)',
+                  fontSize: 11, fontWeight: active ? 700 : 500,
+                  cursor: 'pointer', transition: 'all 0.15s', fontFamily: 'inherit',
+                  boxShadow: active ? `0 0 8px ${opt.color}25` : 'none',
+                }}
+              >
+                {opt.label}
+              </button>
+            )
+          })}
+        </div>
+        {envFilter && (
+          <span style={{ fontSize: 10, color: 'var(--txt-3)' }}>
+            Showing{' '}
+            <span style={{ color: ENV_OPTS.find(o => o.value === envFilter)?.color, fontWeight: 700 }}>
+              {envFilter}
+            </span>
+            {' '}environment only
+          </span>
+        )}
+      </div>
+
       {/* ── KPI grid: 4 × 2 ───────────────────────────────────────────────── */}
       <div className="stagger dash-kpi" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10, marginBottom: 14 }}>
         <KpiCard icon={<Zap size={15} />}         value={proxyTotal}      label="Registered APIs"    color="#324dff"  onClick={() => navigate('/proxy')}      />
@@ -646,7 +689,15 @@ export default function Dashboard() {
 
             {/* API Traffic — 75% */}
             <div style={{ flex: 3, background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 'var(--r-lg)', padding: '14px 16px', display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-              <SectionHeader icon={<Activity size={11} />} label="API Traffic" color="#10b981" right="Last 24 hours" />
+              <SectionHeader
+                icon={<Activity size={11} />}
+                label="API Traffic"
+                color="#10b981"
+                right={envFilter
+                  ? <span>Last 24h · <span style={{ color: ENV_OPTS.find(o => o.value === envFilter)?.color, fontWeight: 700, textTransform: 'uppercase', fontSize: 9 }}>{envFilter}</span></span>
+                  : 'Last 24 hours'
+                }
+              />
               <MetricsTable rows={metricsTop5} />
               <button onClick={() => navigate('/proxy')} style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 10, background: 'none', border: 'none', cursor: 'pointer', color: accent, fontSize: 12, fontWeight: 600, padding: 0, fontFamily: 'inherit' }}>
                 View all APIs <ChevronRight size={12} />
