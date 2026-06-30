@@ -9,7 +9,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   getDashboardMetrics, getBlacklist, addBlacklist, removeBlacklist,
   getRateLimit, updateRateLimit, getCors, updateCors,
-  listAccessTokens, createAccessToken, revokeAccessToken, rotateAccessToken,
+  listAccessTokens, createAccessToken, revokeAccessToken, rotateAccessToken, deleteAccessToken,
   listScrapingBlocklist, addToScrapingBlocklist, removeFromScrapingBlocklist, toggleScrapingBlocklistEntry,
 } from '../api/governance'
 import type { ApiMetrics, BlacklistEntry, AccessToken, UaBlocklistEntry, RateLimitScope, ThrottleStrategy, RateEnforcer } from '../api/governance'
@@ -650,6 +650,8 @@ function CorsPane({
   )
 }
 
+const TOKEN_PAGE_SIZE = 6
+
 function TokensPane({
   selectedApiId,
   qc,
@@ -658,6 +660,7 @@ function TokensPane({
   const [tokenForm, setTokenForm] = useState<TokenForm>({ name: '', description: '', expiresAt: '' })
   const [tokenFormErrors, setTokenFormErrors] = useState<Partial<Record<keyof TokenForm, string>>>({})
   const [revealModal, setRevealModal] = useState<{ token: string; title: string; curlCommand: string } | null>(null)
+  const [tokenPage, setTokenPage] = useState(0)
 
   const { data: apiDetail } = useQuery({
     queryKey: ['proxy-api', selectedApiId],
@@ -725,6 +728,12 @@ function TokensPane({
     onError: () => toast.error('Failed to rotate token'),
   })
 
+  const deleteTokenMutation = useMutation({
+    mutationFn: (id: string) => deleteAccessToken(selectedApiId, id),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['access-tokens', selectedApiId] }); toast.success('Token permanently deleted') },
+    onError: () => toast.error('Failed to delete token'),
+  })
+
   function validateTokenForm(): boolean {
     const e: typeof tokenFormErrors = {}
     if (!tokenForm.name.trim()) e.name = 'Required'
@@ -771,7 +780,7 @@ function TokensPane({
         : <span style={{ color: 'var(--txt-3)', fontSize: 12 }}>Never</span>,
     },
     {
-      key: 'actions', title: '', width: 140,
+      key: 'actions', title: '', width: 160,
       render: (row) => (
         <div style={{ display: 'flex', gap: 4 }}>
           <Confirm
@@ -779,25 +788,21 @@ function TokensPane({
             description="The new token will be shown once and cannot be retrieved later."
             onConfirm={() => rotateMutation.mutate(row.id)}
           >
-            <Btn
-              variant="ghost"
-              size="sm"
-              icon={<RotateCcw size={12} />}
-              disabled={row.status === 'REVOKED'}
-            >
+            <Btn variant="ghost" size="sm" icon={<RotateCcw size={12} />} disabled={row.status === 'REVOKED'}>
               Rotate
             </Btn>
           </Confirm>
-          <Confirm
-            title="Revoke Token"
-            description="This action cannot be undone."
-            danger
-            onConfirm={() => revokeMutation.mutate(row.id)}
-          >
-            <Btn variant="danger" size="sm" disabled={row.status === 'REVOKED'}>
-              Revoke
-            </Btn>
-          </Confirm>
+          {row.status === 'REVOKED' ? (
+            <Confirm title="Permanently delete this token?" danger onConfirm={() => deleteTokenMutation.mutate(row.id)}>
+              <Btn variant="danger" size="sm" icon={<Trash2 size={12} />} loading={deleteTokenMutation.isPending}>
+                Delete
+              </Btn>
+            </Confirm>
+          ) : (
+            <Confirm title="Revoke Token" description="This action cannot be undone." danger onConfirm={() => revokeMutation.mutate(row.id)}>
+              <Btn variant="danger" size="sm">Revoke</Btn>
+            </Confirm>
+          )}
         </div>
       ),
     },
@@ -830,15 +835,27 @@ function TokensPane({
             Create Token
           </Btn>
         </div>
-        <div style={{ flex: 1, overflow: 'auto' }}>
-          <Tbl
-            columns={columns}
-            data={data?.content ?? []}
-            rowKey="id"
-            loading={isLoading}
-            emptyText="No access tokens"
-          />
-        </div>
+        {(() => {
+          const allTokens = data?.content ?? []
+          const totalTokenPages = Math.ceil(allTokens.length / TOKEN_PAGE_SIZE)
+          const pagedTokens = allTokens.slice(tokenPage * TOKEN_PAGE_SIZE, (tokenPage + 1) * TOKEN_PAGE_SIZE)
+          return (
+            <>
+              <div style={{ flex: 1, overflow: 'auto' }}>
+                <Tbl columns={columns} data={pagedTokens} rowKey="id" loading={isLoading} emptyText="No access tokens" />
+              </div>
+              {totalTokenPages > 1 && (
+                <div style={{ flexShrink: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0', borderTop: '1px solid var(--border)', fontSize: 12, color: 'var(--txt-3)' }}>
+                  <span>{allTokens.length} tokens · page {tokenPage + 1} of {totalTokenPages}</span>
+                  <div style={{ display: 'flex', gap: 4 }}>
+                    <Btn size="sm" variant="ghost" disabled={tokenPage === 0} onClick={() => setTokenPage(p => p - 1)}>← Prev</Btn>
+                    <Btn size="sm" variant="ghost" disabled={tokenPage >= totalTokenPages - 1} onClick={() => setTokenPage(p => p + 1)}>Next →</Btn>
+                  </div>
+                </div>
+              )}
+            </>
+          )
+        })()}
       </div>
 
       {/* Create token drawer */}
@@ -1085,6 +1102,7 @@ export default function Governance() {
   const qc = useQueryClient()
 
   useEffect(() => { setMetricsPage(0); setSelectedApiId(''); setSelectedApiName('') }, [selectedEnv])
+  useEffect(() => { setMetricsPage(0) }, [apiSearch])
 
   // ── Queries ────────────────────────────────────────────────────────────────
 
@@ -1131,8 +1149,9 @@ export default function Governance() {
   // ── Derived metrics ────────────────────────────────────────────────────────
 
   const metrics = metricsData ?? []
-  const metricsTotalPages = Math.ceil(metrics.length / METRICS_PAGE_SIZE)
-  const pagedMetrics = metrics.slice(metricsPage * METRICS_PAGE_SIZE, (metricsPage + 1) * METRICS_PAGE_SIZE)
+  const filteredMetrics = apiSearch ? metrics.filter(m => m.apiName?.toLowerCase().includes(apiSearch.toLowerCase())) : metrics
+  const metricsTotalPages = Math.ceil(filteredMetrics.length / METRICS_PAGE_SIZE)
+  const pagedMetrics = filteredMetrics.slice(metricsPage * METRICS_PAGE_SIZE, (metricsPage + 1) * METRICS_PAGE_SIZE)
   const totalRequests24h      = metrics.reduce((s, m) => s + (m.requestsLast24h ?? 0), 0)
   const totalErrors           = metrics.reduce((s, m) => s + (m.errorCount ?? 0), 0)
   const totalRateLimitTriggers = metrics.reduce((s, m) => s + (m.rateLimitTriggers ?? 0), 0)
@@ -1391,6 +1410,16 @@ export default function Governance() {
             />
           </div>
 
+          {/* Search */}
+          <div style={{ flexShrink: 0, marginBottom: 8, position: 'relative' }}>
+            <input
+              value={apiSearch}
+              onChange={e => setApiSearch(e.target.value)}
+              placeholder="Search API…"
+              style={{ width: '100%', paddingLeft: 12, paddingRight: 8, paddingTop: 7, paddingBottom: 7, fontSize: 12, border: '1px solid var(--border)', borderRadius: 'var(--r-sm)', background: 'var(--surface-1)', color: 'var(--txt-1)', outline: 'none', boxSizing: 'border-box' }}
+            />
+          </div>
+
           {/* Table */}
           <div style={{ flex: 1, overflow: 'auto' }}>
             {metricsLoading ? (
@@ -1420,7 +1449,7 @@ export default function Governance() {
               borderTop: '1px solid var(--border)', background: 'var(--surface-2)',
             }}>
               <span style={{ fontSize: 12, color: 'var(--txt-3)' }}>
-                {metrics.length} APIs · Page {metricsPage + 1} of {metricsTotalPages}
+                {filteredMetrics.length} APIs · Page {metricsPage + 1} of {metricsTotalPages}
               </span>
               <div style={{ display: 'flex', gap: 6 }}>
                 <Btn

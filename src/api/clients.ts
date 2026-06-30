@@ -29,8 +29,23 @@ export interface ClientRotated {
   newClientSecret: string
 }
 
+export interface PageResponse<T> {
+  content: T[]
+  page: number
+  size: number
+  totalElements: number
+  totalPages: number
+  last: boolean
+}
+
 export const listClients = (): Promise<AxiosResponse<ClientCredential[]>> =>
   client.get('/clients')
+
+export const listClientsPaged = (params: {
+  page: number
+  size: number
+}): Promise<AxiosResponse<PageResponse<ClientCredential>>> =>
+  client.get('/clients', { params })
 
 export const listPartnerClients = (partnerId: string): Promise<AxiosResponse<ClientCredential[]>> =>
   client.get(`/tag/partners/${partnerId}/clients`)
@@ -63,3 +78,6 @@ export const rotateSecret = (id: string): Promise<AxiosResponse<ClientRotated>> 
 
 export const revokeClient = (id: string): Promise<AxiosResponse<void>> =>
   client.delete(`/clients/${id}`)
+
+export const purgeClient = (id: string): Promise<AxiosResponse<void>> =>
+  client.delete(`/clients/${id}/purge`)

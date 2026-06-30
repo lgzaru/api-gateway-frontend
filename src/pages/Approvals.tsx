@@ -5,6 +5,9 @@ import {
   listPending, approveApproval, rejectApproval, cancelApproval,
 } from '../api/approvals'
 import type { Approval } from '../api/approvals'
+import { getPendingIpRequests, reviewIpRequest } from '../api/partners'
+import { listUsers } from '../api/users'
+import type { IpRequest } from '../api/partners'
 import {
   Btn, Tag, Tbl, Drawer, Modal, toast,
 } from '../components/ui'
@@ -24,12 +27,51 @@ export default function Approvals() {
   const [selected, setSelected] = useState<Approval | null>(null)
   const [review, setReview] = useState<ReviewAction | null>(null)
   const [reviewNote, setReviewNote] = useState('')
+  const [ipReview, setIpReview] = useState<ReviewAction | null>(null)
+  const [ipReviewNote, setIpReviewNote] = useState('')
   const qc = useQueryClient()
 
   const { data, isLoading } = useQuery({
     queryKey: ['approvals', page],
     queryFn: () => listPending({ page, size: 20 }),
     select: (res) => res.data,
+  })
+
+  const { data: ipData, isLoading: ipLoading } = useQuery({
+    queryKey: ['approvals-ip-pending'],
+    queryFn: () => getPendingIpRequests({ page: 0, size: 50 }),
+    select: (res) => res.data,
+  })
+
+  const { data: usersData } = useQuery({
+    queryKey: ['users-lookup'],
+    queryFn: () => listUsers({ page: 0, size: 200 }),
+    select: (res) => Object.fromEntries(res.data.content.map(u => [u.id, u.fullName || u.username])),
+    staleTime: 60_000,
+  })
+
+  const ipApproveMutation = useMutation({
+    mutationFn: ({ id, note }: { id: string; note?: string }) =>
+      reviewIpRequest(id, { status: 'APPROVED', reviewNotes: note }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['approvals-ip-pending'] })
+      qc.invalidateQueries({ queryKey: ['dash-pending-ip'] })
+      setIpReview(null); setIpReviewNote('')
+      toast.success('IP request approved')
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.message ?? 'Failed to approve'),
+  })
+
+  const ipRejectMutation = useMutation({
+    mutationFn: ({ id, note }: { id: string; note?: string }) =>
+      reviewIpRequest(id, { status: 'REJECTED', reviewNotes: note }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['approvals-ip-pending'] })
+      qc.invalidateQueries({ queryKey: ['dash-pending-ip'] })
+      setIpReview(null); setIpReviewNote('')
+      toast.success('IP request rejected')
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.message ?? 'Failed to reject'),
   })
 
   const approveMutation = useMutation({
@@ -132,6 +174,61 @@ export default function Approvals() {
     },
   ]
 
+  const ipItems: IpRequest[] = ipData?.content ?? []
+
+  const ipColumns: Column<IpRequest>[] = [
+    {
+      key: 'action', title: 'Action',
+      render: (r) => (
+        <span style={{ fontFamily: 'monospace', fontSize: 12, fontWeight: 600, color: r.action === 'ADD' ? 'var(--green)' : 'var(--red)' }}>
+          IP {r.action}
+        </span>
+      ),
+    },
+    {
+      key: 'ipCidr', title: 'IP / CIDR',
+      render: (r) => <span style={{ fontFamily: 'monospace', fontSize: 12, color: 'var(--txt-1)' }}>{r.ipCidr}</span>,
+    },
+    {
+      key: 'status', title: 'Status', width: 110,
+      render: (r) => <Tag color={STATUS_COLOR[r.status] ?? 'muted'}>{r.status}</Tag>,
+    },
+    {
+      key: 'requestedBy', title: 'Requested By', width: 160,
+      render: (r) => (
+        <span style={{ fontSize: 12, color: 'var(--txt-1)' }}>
+          {usersData?.[r.requestedBy ?? ''] || r.reason || '—'}
+        </span>
+      ),
+    },
+    {
+      key: 'createdAt', title: 'Requested At', width: 140,
+      render: (r) => dayjs(r.createdAt).format('MMM D, YYYY HH:mm'),
+    },
+    {
+      key: 'ipActions', title: '', width: 160,
+      render: (r) => {
+        if (r.status !== 'PENDING') return null
+        return (
+          <div style={{ display: 'flex', gap: 4 }}>
+            <Btn
+              variant="ghost" size="sm"
+              icon={<CheckCircle2 size={13} style={{ color: 'var(--green)' }} />}
+              style={{ color: 'var(--green)' }}
+              onClick={(e) => { e.stopPropagation(); setIpReview({ id: r.id, type: 'approve' }) }}
+            >Approve</Btn>
+            <Btn
+              variant="ghost" size="sm"
+              icon={<XCircle size={13} style={{ color: 'var(--red)' }} />}
+              style={{ color: 'var(--red)' }}
+              onClick={(e) => { e.stopPropagation(); setIpReview({ id: r.id, type: 'reject' }) }}
+            >Reject</Btn>
+          </div>
+        )
+      },
+    },
+  ]
+
   const statCard = (label: string, value: number, color?: string) => (
     <div className="card-sm">
       <div style={{ fontSize: 11, color: 'var(--txt-3)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 4 }}>{label}</div>
@@ -204,6 +301,19 @@ export default function Approvals() {
         )}
       </Drawer>
 
+      {/* IP Requests Section */}
+      <div style={{ marginTop: 32 }}>
+        <h3 style={{ margin: '0 0 4px', fontSize: 16, fontWeight: 700, color: 'var(--txt-1)' }}>Pending IP Requests</h3>
+        <p style={{ margin: '0 0 12px', color: 'var(--txt-3)', fontSize: 13 }}>Partner IP allowlist add / remove requests awaiting review</p>
+        <Tbl
+          columns={ipColumns}
+          data={ipItems}
+          rowKey="id"
+          loading={ipLoading}
+          emptyText="No pending IP requests"
+        />
+      </div>
+
       {/* Approve / Reject Modal */}
       <Modal
         title={review?.type === 'approve' ? 'Approve Request' : 'Reject Request'}
@@ -235,6 +345,43 @@ export default function Approvals() {
             rows={3}
             value={reviewNote}
             onChange={e => setReviewNote(e.target.value)}
+            placeholder="Optional note to accompany your decision"
+            style={{ width: '100%', padding: '8px 10px', borderRadius: 'var(--r-sm)', border: '1px solid var(--border)', background: 'var(--surface)', color: 'var(--txt-1)', fontSize: 13, resize: 'vertical', boxSizing: 'border-box' }}
+          />
+        </div>
+      </Modal>
+
+      {/* IP Request Approve / Reject Modal */}
+      <Modal
+        title={ipReview?.type === 'approve' ? 'Approve IP Request' : 'Reject IP Request'}
+        open={!!ipReview}
+        onClose={() => { setIpReview(null); setIpReviewNote('') }}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+            <Btn variant="secondary" onClick={() => { setIpReview(null); setIpReviewNote('') }}>Cancel</Btn>
+            <Btn
+              variant={ipReview?.type === 'approve' ? 'primary' : 'danger'}
+              loading={ipApproveMutation.isPending || ipRejectMutation.isPending}
+              onClick={() => {
+                if (!ipReview) return
+                if (ipReview.type === 'approve') {
+                  ipApproveMutation.mutate({ id: ipReview.id, note: ipReviewNote || undefined })
+                } else {
+                  ipRejectMutation.mutate({ id: ipReview.id, note: ipReviewNote || undefined })
+                }
+              }}
+            >
+              {ipReview?.type === 'approve' ? 'Approve' : 'Reject'}
+            </Btn>
+          </div>
+        }
+      >
+        <div className="field">
+          <label className="field-label">Note (optional)</label>
+          <textarea
+            rows={3}
+            value={ipReviewNote}
+            onChange={e => setIpReviewNote(e.target.value)}
             placeholder="Optional note to accompany your decision"
             style={{ width: '100%', padding: '8px 10px', borderRadius: 'var(--r-sm)', border: '1px solid var(--border)', background: 'var(--surface)', color: 'var(--txt-1)', fontSize: 13, resize: 'vertical', boxSizing: 'border-box' }}
           />

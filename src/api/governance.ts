@@ -165,6 +165,9 @@ export const rotateAccessToken = (
 ): Promise<AxiosResponse<AccessTokenCreated>> =>
   client.post(`/tag/governance/apis/${apiId}/tokens/${tokenId}/rotate`)
 
+export const deleteAccessToken = (apiId: string, tokenId: string): Promise<AxiosResponse<void>> =>
+  client.delete(`/tag/governance/apis/${apiId}/tokens/${tokenId}`)
+
 // Scraping Prevention
 export const listScrapingBlocklist = (): Promise<AxiosResponse<UaBlocklistEntry[]>> =>
   client.get('/tag/governance/scraping/blocklist')

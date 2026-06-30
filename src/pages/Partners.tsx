@@ -1,11 +1,11 @@
-import { useState, type ReactNode } from 'react'
+import { useState, useEffect, type ReactNode } from 'react'
 import { copyToClipboard } from '../utils/clipboard'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   listPartners, createPartner, updatePartner, deletePartner,
   listBundles, createBundle, updateBundle, deleteBundle,
   getWorkflowHistory, submitWorkflowStep, approveWorkflowStep, rejectWorkflowStep, skipLegal,
-  listIpRequests, createIpRequest, reviewIpRequest, getEffectiveWhitelist,
+  listIpRequests, createIpRequest, reviewIpRequest, getEffectiveWhitelist, deleteIpRequest,
 } from '../api/partners'
 import type { Partner, PartnerBundle, OnboardingStep, IpRequest } from '../api/partners'
 import { listApis } from '../api/proxy'
@@ -16,12 +16,12 @@ import {
 import type { Column, TabItem } from '../components/ui'
 import {
   Plus, Trash2, Pencil, CheckCircle2, XCircle,
-  GitBranch, Shield, Zap, ExternalLink, ChevronRight, Search,
+  GitBranch, Shield, Zap, ExternalLink, ChevronLeft, ChevronRight, Search,
   Mail, Phone, Building2, Clock, Check, X, BarChart3,
   Key, RotateCcw, Lock, Copy, Info,
 } from 'lucide-react'
 import {
-  listPartnerClients, createPartnerClient, rotateSecret, revokeClient, updateClient,
+  listPartnerClients, createPartnerClient, rotateSecret, revokeClient, updateClient, purgeClient,
 } from '../api/clients'
 import type { ClientCredential } from '../api/clients'
 import dayjs from 'dayjs'
@@ -206,8 +206,12 @@ export default function Partners() {
   const [showIpInfo, setShowIpInfo] = useState(false)
   const [ipInline, setIpInline] = useState({ ipCidr: '', action: 'ADD', reason: '' })
   const [ipInlineErrors, setIpInlineErrors] = useState<Record<string, string>>({})
+  const [ipPage, setIpPage] = useState(0)
+  const [ipSearch, setIpSearch] = useState('')
 
   const qc = useQueryClient()
+
+  useEffect(() => { setIpPage(0) }, [selected?.id])
 
   // ── Queries ──────────────────────────────────────────────────────────────────
 
@@ -353,6 +357,16 @@ export default function Partners() {
     onError: () => toast.error('Failed to review IP request'),
   })
 
+  const deleteIpMutation = useMutation({
+    mutationFn: (id: string) => deleteIpRequest(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['partner-ip-requests', selected?.id] })
+      qc.invalidateQueries({ queryKey: ['partner-ip-whitelist', selected?.id] })
+      toast.success('IP entries deleted')
+    },
+    onError: () => toast.error('Failed to delete IP request'),
+  })
+
   const downloadPostmanMutation = useMutation({
     mutationFn: (partnerId: string) => getPostmanCollection(partnerId),
     onSuccess: (res, partnerId) => downloadBlob(res.data, `postman-${partnerId}.json`, 'application/json'),
@@ -487,6 +501,15 @@ export default function Partners() {
     onError: () => toast.error('Failed to revoke credential'),
   })
 
+  const purgeCredMutation = useMutation({
+    mutationFn: (id: string) => purgeClient(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['partner-clients', selected?.id] })
+      toast.success('Credential permanently deleted')
+    },
+    onError: () => toast.error('Failed to delete credential'),
+  })
+
   const fetchSnippetMutation = useMutation({
     mutationFn: ({ partnerId, lang }: { partnerId: string; lang: typeof sdkLanguage }) => getCodeSnippet(partnerId, lang),
     onSuccess: (res) => setSdkSnippet(res.data),
@@ -570,29 +593,38 @@ export default function Partners() {
     {
       key: 'review',
       title: '',
-      width: 160,
-      render: (r) => isAdmin && r.status === 'PENDING' ? (
+      width: 180,
+      render: (r) => (
         <div style={{ display: 'flex', gap: 4 }}>
-          <Btn
-            size="sm"
-            variant="link"
-            icon={<CheckCircle2 size={12} />}
-            style={{ color: 'var(--green)' }}
-            onClick={() => setReviewModal({ id: r.id, action: 'APPROVED' })}
-          >
-            Approve
-          </Btn>
-          <Btn
-            size="sm"
-            variant="link"
-            icon={<XCircle size={12} />}
-            style={{ color: 'var(--red)' }}
-            onClick={() => setReviewModal({ id: r.id, action: 'REJECTED' })}
-          >
-            Reject
-          </Btn>
+          {isAdmin && r.status === 'PENDING' && (
+            <>
+              <Btn
+                size="sm"
+                variant="link"
+                icon={<CheckCircle2 size={12} />}
+                style={{ color: 'var(--green)' }}
+                onClick={() => setReviewModal({ id: r.id, action: 'APPROVED' })}
+              >
+                Approve
+              </Btn>
+              <Btn
+                size="sm"
+                variant="link"
+                icon={<XCircle size={12} />}
+                style={{ color: 'var(--red)' }}
+                onClick={() => setReviewModal({ id: r.id, action: 'REJECTED' })}
+              >
+                Reject
+              </Btn>
+            </>
+          )}
+          {r.action === 'REMOVE' && (
+            <Confirm danger title={`Delete this REMOVE request for ${r.ipCidr}?`} onConfirm={() => deleteIpMutation.mutate(r.id)}>
+              <Btn size="sm" variant="danger" icon={<Trash2 size={12} />} iconOnly loading={deleteIpMutation.isPending} />
+            </Confirm>
+          )}
         </div>
-      ) : null,
+      ),
     },
   ]
 
@@ -902,9 +934,16 @@ export default function Partners() {
             {effectiveWhitelist && effectiveWhitelist.length > 0 ? (
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                 {effectiveWhitelist.map(cidr => (
-                  <span key={cidr} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, fontFamily: 'monospace', padding: '3px 10px', borderRadius: 'var(--r-sm)', background: 'rgba(34,197,94,0.12)', border: '1px solid rgba(34,197,94,0.35)', color: 'var(--green)' }}>
+                  <span key={cidr} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, fontFamily: 'monospace', padding: '3px 8px', borderRadius: 'var(--r-sm)', background: 'rgba(34,197,94,0.12)', border: '1px solid rgba(34,197,94,0.35)', color: 'var(--green)' }}>
                     <Check size={10} />
                     {cidr}
+                    <button
+                      title={`Remove ${cidr} from whitelist`}
+                      onClick={() => selected && createIpMutation.mutate({ partnerId: selected.id, data: { ipCidr: cidr, action: 'REMOVE', reason: 'Removed from whitelist' } })}
+                      style={{ display: 'flex', alignItems: 'center', background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: 'inherit', opacity: 0.7, marginLeft: 1 }}
+                    >
+                      <X size={10} />
+                    </button>
                   </span>
                 ))}
               </div>
@@ -955,13 +994,48 @@ export default function Partners() {
             </Btn>
           </div>
 
-          <Tbl
-            columns={ipColumns}
-            data={ipRequests?.content ?? []}
-            rowKey="id"
-            loading={ipLoading}
-            emptyText="No IP requests"
-          />
+          {/* IP search */}
+          <div style={{ position: 'relative' }}>
+            <Search size={12} style={{ position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)', color: 'var(--txt-3)', pointerEvents: 'none' }} />
+            <input
+              value={ipSearch}
+              onChange={e => { setIpSearch(e.target.value); setIpPage(0) }}
+              placeholder="Search IP / CIDR…"
+              style={{ width: '100%', paddingLeft: 26, paddingRight: 8, paddingTop: 6, paddingBottom: 6, fontSize: 12, border: '1px solid var(--border)', borderRadius: 'var(--r-sm)', background: 'var(--surface-1)', color: 'var(--txt-1)', outline: 'none', boxSizing: 'border-box' }}
+            />
+          </div>
+
+          {(() => {
+            const IP_PAGE_SIZE = 6
+            const sorted = [...(ipRequests?.content ?? [])].sort((a, b) =>
+              b.createdAt.localeCompare(a.createdAt)
+            )
+            const filtered = ipSearch ? sorted.filter(r => r.ipCidr.toLowerCase().includes(ipSearch.toLowerCase())) : sorted
+            const totalPages = Math.ceil(filtered.length / IP_PAGE_SIZE)
+            const pageData = filtered.slice(ipPage * IP_PAGE_SIZE, (ipPage + 1) * IP_PAGE_SIZE)
+            return (
+              <>
+                <div style={{ overflowY: 'auto', maxHeight: 400 }}>
+                  <Tbl
+                    columns={ipColumns}
+                    data={pageData}
+                    rowKey="id"
+                    loading={ipLoading}
+                    emptyText="No IP requests"
+                  />
+                </div>
+                {filtered.length > IP_PAGE_SIZE && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12, color: 'var(--txt-3)', paddingTop: 4 }}>
+                    <span>{filtered.length} total · page {ipPage + 1} of {totalPages}</span>
+                    <div style={{ display: 'flex', gap: 4 }}>
+                      <Btn size="sm" variant="link" icon={<ChevronLeft size={13} />} disabled={ipPage === 0} onClick={() => setIpPage(p => p - 1)} />
+                      <Btn size="sm" variant="link" icon={<ChevronRight size={13} />} disabled={ipPage >= totalPages - 1} onClick={() => setIpPage(p => p + 1)} />
+                    </div>
+                  </div>
+                )}
+              </>
+            )
+          })()}
         </div>
       ),
     },
@@ -1050,9 +1124,15 @@ export default function Partners() {
                         Rotate
                       </Btn>
                     </Confirm>
-                    <Confirm danger title="Revoke this credential? This cannot be undone." onConfirm={() => revokeCredMutation.mutate(c.id)}>
-                      <Btn variant="ghost" size="sm" iconOnly icon={<Trash2 size={12} />} disabled={c.status === 'REVOKED'} style={{ color: 'var(--red)' }} />
-                    </Confirm>
+                    {c.status === 'REVOKED' ? (
+                      <Confirm danger title="Permanently delete this credential? This cannot be undone." onConfirm={() => purgeCredMutation.mutate(c.id)}>
+                        <Btn variant="ghost" size="sm" iconOnly icon={<Trash2 size={12} />} loading={purgeCredMutation.isPending} style={{ color: 'var(--red)' }} />
+                      </Confirm>
+                    ) : (
+                      <Confirm danger title="Revoke this credential? This cannot be undone." onConfirm={() => revokeCredMutation.mutate(c.id)}>
+                        <Btn variant="ghost" size="sm" iconOnly icon={<Trash2 size={12} />} style={{ color: 'var(--red)' }} />
+                      </Confirm>
+                    )}
                   </div>
                 </div>
               ))}

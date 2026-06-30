@@ -75,6 +75,12 @@ export const updatePartner = (
 export const deletePartner = (id: string): Promise<AxiosResponse<void>> =>
   client.delete(`/tag/partners/${id}`)
 
+export const listAllBundles = (params: {
+  page?: number
+  size?: number
+}): Promise<AxiosResponse<PageResponse<PartnerBundle>>> =>
+  client.get('/tag/partners/bundles', { params })
+
 export const listBundles = (
   partnerId: string,
   params: { page?: number; size?: number }
@@ -180,6 +186,9 @@ export const getPendingIpRequests = (
   params?: { page?: number; size?: number }
 ): Promise<AxiosResponse<PageResponse<IpRequest>>> =>
   client.get('/tag/ip-requests/pending', { params })
+
+export const deleteIpRequest = (id: string): Promise<AxiosResponse<void>> =>
+  client.delete(`/tag/ip-requests/${id}`)
 
 export const getEffectiveWhitelist = (
   partnerId: string

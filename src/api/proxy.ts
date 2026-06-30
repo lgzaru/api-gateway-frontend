@@ -6,9 +6,10 @@ export type ProxyEnvironment = 'prod' | 'dev' | 'sandbox'
 export type HealthStatus = 'UP' | 'DOWN' | 'DEGRADED' | 'UNKNOWN'
 export type TransformType = 'HEADER_INJECT' | 'HEADER_STRIP' | 'BODY_MASK' | 'BODY_FILTER' | 'STATUS_REMAP'
 export type ReplayStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED'
-export type UpstreamAuthType = 'NONE' | 'API_KEY' | 'BEARER_TOKEN' | 'OAUTH2_PASSWORD' | 'BASIC_AUTH'
+export type UpstreamAuthType = 'NONE' | 'API_KEY' | 'BEARER_TOKEN' | 'CUSTOM_TOKEN' | 'OAUTH2_PASSWORD' | 'BASIC_AUTH'
 export type ParameterSource = 'CALLER' | 'STATIC' | 'AUTO_UUID' | 'AUTO_TIMESTAMP'
-export type ParameterType   = 'BODY' | 'QUERY'
+export type ParameterType   = 'BODY' | 'QUERY' | 'PATH'
+export type BodyMode        = 'TEMPLATE' | 'PASSTHROUGH'
 
 export interface ProxyApiTag {
   id: string
@@ -35,7 +36,9 @@ export interface ProxyApi {
   createdAt: string
   updatedAt: string
   httpMethod: string | null
+  bodyMode: BodyMode
   requestBodyTemplate: string | null
+  samplePayload: string | null
   exposedDomain: string | null
   exposedPath: string | null
   builtIn: boolean
@@ -44,6 +47,7 @@ export interface ProxyApi {
   upstreamAuthUrl: string | null
   upstreamAuthUsername: string | null
   upstreamClientId: string | null
+  upstreamTokenField: string | null
   tags: string[]
 }
 
@@ -77,11 +81,13 @@ export interface RequestLog {
   id: string
   proxyApiId: string
   apiName: string
+  partnerName?: string | null
   method: string
   path: string
   clientIp: string
   statusCode: number | null
   responseTimeMs: number | null
+  gatewayLatencyMs: number | null
   environment: string
   createdAt: string
   hasRequestBody: boolean
@@ -167,7 +173,9 @@ export const getApi = (id: string): Promise<AxiosResponse<ProxyApi>> =>
 
 export interface UpstreamAuthFields {
   httpMethod?: string
+  bodyMode?: BodyMode
   requestBodyTemplate?: string
+  samplePayload?: string
   exposedDomain?: string
   exposedPath?: string
   upstreamAuthType?: UpstreamAuthType
@@ -178,6 +186,7 @@ export interface UpstreamAuthFields {
   upstreamAuthPassword?: string
   upstreamClientId?: string
   upstreamClientSecret?: string
+  upstreamTokenField?: string
 }
 
 export const registerApi = (data: {
@@ -325,8 +334,14 @@ export const deleteParameter = (apiId: string, paramId: string): Promise<AxiosRe
 
 // ── Test ──────────────────────────────────────────────────────────────────────
 
-export const testApi = (apiId: string, callerParams: Record<string, unknown>): Promise<AxiosResponse<TestApiResponse>> =>
-  client.post(`/tag/proxy/apis/${apiId}/test`, { callerParams })
+export const testApi = (apiId: string, callerParams: Record<string, unknown>, rawBody?: string): Promise<AxiosResponse<TestApiResponse>> =>
+  client.post(`/tag/proxy/apis/${apiId}/test`, { callerParams, rawBody: rawBody ?? null })
+
+export interface TestState { bodyMode: 'params' | 'raw'; rawBody: string | null }
+export const getTestState = (apiId: string): Promise<AxiosResponse<TestState>> =>
+  client.get(`/tag/proxy/apis/${apiId}/test-state`)
+export const saveTestState = (apiId: string, data: { bodyMode: string; rawBody: string | null }): Promise<AxiosResponse<void>> =>
+  client.put(`/tag/proxy/apis/${apiId}/test-state`, data)
 
 // ── Tags ──────────────────────────────────────────────────────────────────────
 

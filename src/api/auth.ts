@@ -1,5 +1,24 @@
 import axios from 'axios'
+import type { AxiosResponse } from 'axios'
 import client from './client'
+
+export interface CurrentUser {
+  id: string
+  username: string
+  email: string
+  fullName: string | null
+  status: string
+  twoFactorEnabled: boolean
+  roles: { id: string; code: string; name: string; description: string; permissionCount: number }[]
+  directPermissions: string[]
+  allPermissions: string[]
+  lastLogin: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export const getMe = (): Promise<AxiosResponse<CurrentUser>> =>
+  client.get('/auth/me')
 
 export const login = (login: string, password: string) =>
   axios.post('/api/v1/auth/login', { login, password })

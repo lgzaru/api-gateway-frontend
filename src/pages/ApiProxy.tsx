@@ -1,11 +1,11 @@
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import {
   Plus, Trash2, Pencil, CheckCircle2, XCircle, HelpCircle,
   Zap, PlayCircle, Settings, Bug, RotateCcw, History,
   RefreshCw, Copy, Code2, FlaskConical, Maximize2,
   Globe, Lock, Unlock, Server, Fingerprint,
   ShieldCheck, Key, Info, AlertTriangle, Search, X, Tags,
-  CopyPlus, GripVertical,
+  CopyPlus, GripVertical, Wand2,
 } from 'lucide-react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -14,8 +14,8 @@ import {
   listTransforms, createTransform, deleteTransform, updateTransform,
   listMocks, createMock, updateMock, deleteMock,
   listReplays, triggerReplay,
-  listParameters, createParameter, deleteParameter,
-  testApi,
+  listParameters, createParameter, updateParameter, deleteParameter,
+  testApi, getTestState, saveTestState,
   listTags, createTag, updateTag, deleteTag,
 } from '../api/proxy'
 import type {
@@ -85,10 +85,47 @@ function randomId(): string {
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
+interface ApiLocalMeta { bodyMode?: string; samplePayload?: string }
+function saveApiMeta(id: string, meta: ApiLocalMeta) {
+  try { localStorage.setItem(`pus-api-meta-${id}`, JSON.stringify(meta)) } catch {}
+}
+function loadApiMeta(id: string): ApiLocalMeta {
+  try { return JSON.parse(localStorage.getItem(`pus-api-meta-${id}`) ?? '{}') } catch { return {} }
+}
+
 function prettyJson(s: string | null | undefined): string {
   if (!s) return ''
   try { return JSON.stringify(JSON.parse(s), null, 2) }
   catch { return s }
+}
+
+function templatizeJson(jsonStr: string): string {
+  if (!jsonStr.trim()) return jsonStr
+
+  // Pass 1 — count replaceable occurrences per key name
+  const counts: Record<string, number> = {}
+  const countPatterns = [
+    /"(\w+)"\s*:\s*"(?!\{\{)[^"]*"/g,      // strings (skip already-templated)
+    /"(\w+)"\s*:\s*-?\d+(?:\.\d+)?\b/g,    // numbers
+    /"(\w+)"\s*:\s*(?:true|false)\b/g,     // booleans
+  ]
+  for (const re of countPatterns) {
+    let m: RegExpExecArray | null
+    while ((m = re.exec(jsonStr)) !== null) counts[m[1]] = (counts[m[1]] ?? 0) + 1
+  }
+
+  // Pass 2 — replace, appending an index for any key that appears more than once
+  const seen: Record<string, number> = {}
+  const ph = (key: string) => {
+    if (counts[key] <= 1) return `{{${key}}}`
+    seen[key] = (seen[key] ?? 0) + 1
+    return `{{${key}${seen[key]}}}`
+  }
+
+  return jsonStr
+    .replace(/"(\w+)"(\s*:\s*)"(?!\{\{)([^"]*)"/g, (_, k, sep) => `"${k}"${sep}"${ph(k)}"`)
+    .replace(/"(\w+)"(\s*:\s*)(-?\d+(?:\.\d+)?)\b/g, (_, k, sep) => `"${k}"${sep}${ph(k)}`)
+    .replace(/"(\w+)"(\s*:\s*)(true|false)\b/g, (_, k, sep) => `"${k}"${sep}${ph(k)}`)
 }
 
 function toSlug(name: string): string {
@@ -122,7 +159,6 @@ function loadTestParams(apiId: string): Record<string, string> {
 function persistTestParams(apiId: string, params: Record<string, string>) {
   localStorage.setItem(`pus_params_${apiId}`, JSON.stringify(params))
 }
-
 // ── JSON syntax highlighter ───────────────────────────────────────────────────
 
 type JToken = { text: string; color: string }
@@ -219,11 +255,12 @@ function MethodPicker({ value, onChange }: { value?: string; onChange?: (v: stri
 }
 
 const AUTH_OPTS = [
-  { value: 'NONE',            label: 'None',            sub: 'No upstream auth needed',       icon: <Unlock size={14} /> },
-  { value: 'API_KEY',         label: 'API Key',         sub: 'Custom header injection',       icon: <Key size={14} /> },
-  { value: 'BEARER_TOKEN',    label: 'Bearer Token',    sub: 'Static JWT / access token',     icon: <ShieldCheck size={14} /> },
+  { value: 'NONE',            label: 'None',            sub: 'No upstream auth needed',        icon: <Unlock size={14} /> },
+  { value: 'API_KEY',         label: 'API Key',         sub: 'Custom header injection',        icon: <Key size={14} /> },
+  { value: 'BEARER_TOKEN',    label: 'Bearer Token',    sub: 'Static JWT / access token',      icon: <ShieldCheck size={14} /> },
   { value: 'BASIC_AUTH',      label: 'Basic Auth',      sub: 'Username & password (RFC 7617)', icon: <Lock size={14} /> },
-  { value: 'OAUTH2_PASSWORD', label: 'OAuth2 Password', sub: 'Auto-fetch & cache tokens',     icon: <RefreshCw size={14} /> },
+  { value: 'OAUTH2_PASSWORD', label: 'OAuth2 Password', sub: 'Auto-fetch & cache tokens',      icon: <RefreshCw size={14} /> },
+  { value: 'CUSTOM_TOKEN',    label: 'Custom Token',    sub: 'POST endpoint, any token field', icon: <Fingerprint size={14} /> },
 ]
 function AuthTypeGrid({ value, onChange }: { value?: string; onChange?: (v: string) => void }) {
   return (
@@ -278,10 +315,14 @@ function Field({ label, hint, error, children, style }: {
 
 // ── Register form state ────────────────────────────────────────────────────────
 
+interface RegQueryParam { id?: string; name: string; required: boolean; description: string }
+
 interface RegisterFormState {
   httpMethod: string
+  bodyMode: 'TEMPLATE' | 'PASSTHROUGH'
   internalBaseUrl: string
   requestBodyTemplate: string
+  samplePayload: string
   name: string
   publicPath: string
   description: string
@@ -300,13 +341,17 @@ interface RegisterFormState {
   upstreamAuthPassword: string
   upstreamClientId: string
   upstreamClientSecret: string
+  upstreamTokenField: string
   tags: string[]
+  queryParams: RegQueryParam[]
 }
 
 interface EditFormState {
   httpMethod: string
+  bodyMode: 'TEMPLATE' | 'PASSTHROUGH'
   internalBaseUrl: string
   requestBodyTemplate: string
+  samplePayload: string
   name: string
   description: string
   exposedDomain: string
@@ -324,7 +369,9 @@ interface EditFormState {
   upstreamAuthPassword: string
   upstreamClientId: string
   upstreamClientSecret: string
+  upstreamTokenField: string
   tags: string[]
+  queryParams: RegQueryParam[]
 }
 
 interface TransformFormState {
@@ -364,6 +411,7 @@ export default function ApiProxy() {
   const [detailTab,      setDetailTab]      = useState('overview')
   const [highlightedLogId, setHighlightedLogId] = useState<string | null>(null)
   const [bodyModal, setBodyModal] = useState<{ title: string; body: string } | null>(null)
+  const [templateEditorOpen, setTemplateEditorOpen] = useState(false)
   const [bodyFetchingId, setBodyFetchingId] = useState<string | null>(null)
   const [logsPage,        setLogsPage]        = useState(0)
   const [logsSearchInput, setLogsSearchInput] = useState('')
@@ -376,6 +424,9 @@ export default function ApiProxy() {
   }, [logsSearchInput])
   const [testParams,     setTestParams]     = useState<Record<string, string>>({})
   const [testParamErrors, setTestParamErrors] = useState<Record<string, boolean>>({})
+  const [testBodyMode,   setTestBodyMode]   = useState<'params' | 'raw'>('params')
+  const [testRawBody,    setTestRawBody]    = useState('')
+  const testStateSaveTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
   const [testResult,     setTestResult]     = useState<{
     success: boolean; statusCode: number; responseTimeMs: number;
     requestBodySent: string | null; responseBody: string | null; errorMessage: string | null
@@ -387,7 +438,15 @@ export default function ApiProxy() {
   // ── Register form state ──────────────────────────────────────────────────
   // ── Tag filter / search state ────────────────────────────────────────────
   const [sidebarSearch, setSidebarSearch] = useState('')
-  const [activeTagFilter, setActiveTagFilter] = useState<string | null>(null)
+  const [activeTagFilters, setActiveTagFilters] = useState<string[]>([])
+  const [sortMode, setSortMode] = useState<'manual' | 'name' | 'health' | 'recent'>(() => {
+    const v = localStorage.getItem('pus-api-sort')
+    return v === 'name' || v === 'health' || v === 'recent' || v === 'manual' ? v : 'manual'
+  })
+  const [groupByTag, setGroupByTag] = useState<boolean>(() => localStorage.getItem('pus-api-group') === '1')
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
+    try { return new Set(JSON.parse(localStorage.getItem('pus-api-collapsed-groups') ?? '[]')) } catch { return new Set() }
+  })
   const [activeEnvTab, setActiveEnvTab] = useState<'all' | ProxyEnvironment>('all')
   const [apisPage, setApisPage] = useState(0)
   const [tagManagerOpen, setTagManagerOpen] = useState(false)
@@ -398,12 +457,12 @@ export default function ApiProxy() {
   const [tagChipsExpanded, setTagChipsExpanded] = useState(false)
 
   const defaultRegister: RegisterFormState = {
-    httpMethod: 'POST', internalBaseUrl: '', requestBodyTemplate: '', name: '',
+    httpMethod: 'POST', bodyMode: 'PASSTHROUGH', internalBaseUrl: '', requestBodyTemplate: '', samplePayload: '', name: '',
     publicPath: '', description: '', exposedDomain: '', exposedPath: '',
     environment: 'prod', authRequired: true, healthCheckUrlUnavailable: false, healthCheckUrl: '',
     healthCheckIntervalSecs: '60', upstreamAuthType: 'NONE', upstreamAuthHeader: 'X-API-Key',
     upstreamAuthValue: '', upstreamAuthUrl: '', upstreamAuthUsername: '', upstreamAuthPassword: '',
-    upstreamClientId: '', upstreamClientSecret: '', tags: [],
+    upstreamClientId: '', upstreamClientSecret: '', upstreamTokenField: 'token', tags: [], queryParams: [],
   }
   const [regForm, setRegForm] = useState<RegisterFormState>(defaultRegister)
   const [regErrors, setRegErrors] = useState<Record<string, string>>({})
@@ -419,16 +478,17 @@ export default function ApiProxy() {
 
   // ── Edit form state ──────────────────────────────────────────────────────
   const defaultEdit: EditFormState = {
-    httpMethod: 'POST', internalBaseUrl: '', requestBodyTemplate: '', name: '',
+    httpMethod: 'POST', bodyMode: 'PASSTHROUGH', internalBaseUrl: '', requestBodyTemplate: '', samplePayload: '', name: '',
     description: '', exposedDomain: '', exposedPath: '', environment: 'prod',
     authRequired: true, healthCheckUrlUnavailable: false, healthCheckUrl: '', healthCheckIntervalSecs: '60',
     upstreamAuthType: 'NONE', upstreamAuthHeader: 'X-API-Key', upstreamAuthValue: '',
     upstreamAuthUrl: '', upstreamAuthUsername: '', upstreamAuthPassword: '',
-    upstreamClientId: '', upstreamClientSecret: '', tags: [],
+    upstreamClientId: '', upstreamClientSecret: '', upstreamTokenField: 'token', tags: [], queryParams: [],
   }
   const [editForm, setEditForm] = useState<EditFormState>(defaultEdit)
   const [editErrors, setEditErrors] = useState<Record<string, string>>({})
   const [editStep, setEditStep] = useState<'endpoint' | 'identity' | 'routing' | 'security'>('endpoint')
+  const [editOriginalQueryParams, setEditOriginalQueryParams] = useState<RegQueryParam[]>([])
 
   // ── Transform form state ─────────────────────────────────────────────────
   const [txForm, setTxForm] = useState<TransformFormState>({ name: '', transformType: '', config: '', orderIndex: '0' })
@@ -443,6 +503,7 @@ export default function ApiProxy() {
   const [showMockInfo, setShowMockInfo] = useState(false)
   const [showReplayInfo, setShowReplayInfo] = useState(false)
   const [showKongInfo, setShowKongInfo] = useState(false)
+  const [showLatencyInfo, setShowLatencyInfo] = useState(false)
   const [mockErrors, setMockErrors] = useState<Record<string, string>>({})
   const [editingMock, setEditingMock] = useState<SandboxMock | null>(null)
   const [mockEditForm, setMockEditForm] = useState({ responseStatus: '', responseBody: '', latencyMs: '', priority: '', enabled: true })
@@ -476,7 +537,14 @@ export default function ApiProxy() {
   // ── Mutations ─────────────────────────────────────────────────────────────
 
   const registerMutation = useMutation({
-    mutationFn: registerApi,
+    mutationFn: async ({ queryParams: qps, ...apiData }: Parameters<typeof registerApi>[0] & { queryParams: RegQueryParam[] }) => {
+      const result = await registerApi(apiData)
+      const valid = qps.filter(p => p.name.trim())
+      await Promise.all(valid.map((p, i) =>
+        createParameter(result.data.id, { paramName: p.name.trim(), paramSource: 'CALLER', paramType: 'QUERY', required: p.required, description: p.description || undefined, orderIndex: i })
+      ))
+      return result
+    },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['proxy-apis'] }); setRegisterDrawer(false); setRegForm(defaultRegister); setIsCloneMode(false); setCloneSourceId(null); toast.success('API registered') },
     onError: (err: unknown) => {
       const status = (err as any)?.response?.status
@@ -497,8 +565,37 @@ export default function ApiProxy() {
     },
   })
   const updateMutation = useMutation({
-    mutationFn: ({ id, data }: { id: string; data: Parameters<typeof updateApi>[1] }) => updateApi(id, data),
-    onSuccess: res => { qc.invalidateQueries({ queryKey: ['proxy-apis'] }); setEditDrawer(false); setEditingApi(null); if (selectedApi?.id === res.data.id) setSelectedApi(res.data); toast.success('API updated') },
+    mutationFn: async ({ id, data, queryParams, originalQueryParams }: {
+      id: string
+      data: Parameters<typeof updateApi>[1]
+      queryParams: RegQueryParam[]
+      originalQueryParams: RegQueryParam[]
+    }) => {
+      const result = await updateApi(id, data)
+      const currentIds = new Set(queryParams.map(p => p.id).filter(Boolean))
+      // Delete removed params
+      await Promise.all(
+        originalQueryParams
+          .filter(p => p.id && !currentIds.has(p.id))
+          .map(p => deleteParameter(id, p.id!))
+      )
+      for (const p of queryParams.filter(q => q.name.trim())) {
+        const original = originalQueryParams.find(o => o.id === p.id)
+        if (!p.id) {
+          // New param
+          await createParameter(id, { paramName: p.name.trim(), paramSource: 'CALLER', paramType: 'QUERY', required: p.required, description: p.description || undefined })
+        } else if (original && original.name !== p.name.trim()) {
+          // Name changed — delete old, create new
+          await deleteParameter(id, p.id)
+          await createParameter(id, { paramName: p.name.trim(), paramSource: 'CALLER', paramType: 'QUERY', required: p.required, description: p.description || undefined })
+        } else if (original && (original.required !== p.required || original.description !== p.description)) {
+          // Only metadata changed
+          await updateParameter(id, p.id, { required: p.required, description: p.description || undefined })
+        }
+      }
+      return result
+    },
+    onSuccess: res => { qc.invalidateQueries({ queryKey: ['proxy-apis'] }); qc.invalidateQueries({ queryKey: ['proxy-parameters', res.data.id] }); setEditDrawer(false); setEditingApi(null); if (selectedApi?.id === res.data.id) setSelectedApi(res.data); toast.success('API updated') },
     onError: () => toast.error('Update failed'),
   })
   const deleteMutation = useMutation({
@@ -622,8 +719,9 @@ export default function ApiProxy() {
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
-  function openEdit(api: ProxyApi) {
+  async function openEdit(api: ProxyApi) {
     setEditingApi(api)
+    const localMeta = loadApiMeta(api.id)
     setEditForm({
       name: api.name ?? '',
       description: api.description ?? '',
@@ -634,7 +732,9 @@ export default function ApiProxy() {
       healthCheckUrl: api.healthCheckUrl ?? '',
       healthCheckIntervalSecs: String(api.healthCheckIntervalSecs ?? 60),
       httpMethod: api.httpMethod ?? 'GET',
+      bodyMode: (api.bodyMode ?? localMeta.bodyMode ?? 'PASSTHROUGH') as 'TEMPLATE' | 'PASSTHROUGH',
       requestBodyTemplate: api.requestBodyTemplate ?? '',
+      samplePayload: api.samplePayload ?? localMeta.samplePayload ?? '',
       exposedDomain: (api.exposedDomain ?? '').replace(/^https?:\/\//i, ''),
       exposedPath: api.exposedPath ?? '',
       upstreamAuthType: api.upstreamAuthType ?? 'NONE',
@@ -645,17 +745,30 @@ export default function ApiProxy() {
       upstreamAuthPassword: '',
       upstreamClientId: api.upstreamClientId ?? '',
       upstreamClientSecret: '',
+      upstreamTokenField: api.upstreamTokenField ?? 'token',
       tags: api.tags ?? [],
+      queryParams: [],
     })
+    setEditOriginalQueryParams([])
     setEditErrors({})
     setEditDrawer(true)
+    try {
+      const res = await listParameters(api.id)
+      const qps: RegQueryParam[] = res.data
+        .filter(p => p.paramType === 'QUERY' && p.paramSource === 'CALLER')
+        .map(p => ({ id: p.id, name: p.paramName, required: p.required, description: p.description ?? '' }))
+      setEditOriginalQueryParams(qps)
+      setEditForm(f => ({ ...f, queryParams: qps }))
+    } catch {}
   }
 
   function openClone(api: ProxyApi) {
     setRegForm({
       httpMethod: api.httpMethod ?? 'POST',
+      bodyMode: api.bodyMode ?? 'PASSTHROUGH',
       internalBaseUrl: api.internalBaseUrl,
       requestBodyTemplate: api.requestBodyTemplate ?? '',
+      samplePayload: api.samplePayload ?? '',
       name: `Copy of ${api.name}`,
       publicPath: `${api.publicPath}-copy`,
       description: api.description ?? '',
@@ -674,7 +787,9 @@ export default function ApiProxy() {
       upstreamAuthPassword: '',
       upstreamClientId: api.upstreamClientId ?? '',
       upstreamClientSecret: '',
+      upstreamTokenField: api.upstreamTokenField ?? 'token',
       tags: api.tags ?? [],
+      queryParams: [],
     })
     setIsCloneMode(true)
     setCloneSourceId(api.id)
@@ -687,9 +802,15 @@ export default function ApiProxy() {
     if (selectedApi) {
       setSnapshots(loadSnapshots(selectedApi.id))
       setTestParams(loadTestParams(selectedApi.id))
+      getTestState(selectedApi.id).then(r => {
+        setTestRawBody(r.data.rawBody ?? '')
+        setTestBodyMode((r.data.bodyMode as 'params' | 'raw') ?? 'params')
+      }).catch(() => {})
     } else {
       setSnapshots([])
       setTestParams({})
+      setTestRawBody('')
+      setTestBodyMode('params')
     }
     setShowSnapshots(false)
   }, [selectedApi?.id])
@@ -698,24 +819,36 @@ export default function ApiProxy() {
     if (selectedApi) persistTestParams(selectedApi.id, testParams)
   }, [testParams])
 
+  useEffect(() => {
+    if (!selectedApi) return
+    clearTimeout(testStateSaveTimer.current)
+    testStateSaveTimer.current = setTimeout(() => {
+      saveTestState(selectedApi.id, { bodyMode: testBodyMode, rawBody: testRawBody || null })
+    }, 1200)
+    return () => clearTimeout(testStateSaveTimer.current)
+  }, [testRawBody, testBodyMode, selectedApi?.id])
+
   async function runTest() {
     if (!selectedApi) return
-    const requiredParams = (parametersData ?? []).filter(p => p.paramSource === 'CALLER' && p.required)
-    const errors: Record<string, boolean> = {}
-    for (const p of requiredParams) {
-      if (!testParams[p.paramName]?.trim()) errors[p.paramName] = true
-    }
-    if (Object.keys(errors).length > 0) {
-      setTestParamErrors(errors)
-      toast.error('Fill in all required parameters before sending')
-      return
+    // In raw mode skip CALLER param validation — body is provided directly
+    if (testBodyMode === 'params') {
+      const requiredParams = (parametersData ?? []).filter(p => p.paramSource === 'CALLER' && p.required && p.paramType !== 'QUERY' && p.paramType !== 'PATH')
+      const errors: Record<string, boolean> = {}
+      for (const p of requiredParams) {
+        if (!testParams[p.paramName]?.trim()) errors[p.paramName] = true
+      }
+      if (Object.keys(errors).length > 0) {
+        setTestParamErrors(errors)
+        toast.error('Fill in all required parameters before sending')
+        return
+      }
     }
     setTestParamErrors({})
     setTestLoading(true); setTestResult(null)
     try {
       const params: Record<string, unknown> = {}
       for (const [k, v] of Object.entries(testParams)) if (v !== '') params[k] = v
-      const res = await testApi(selectedApi.id, params)
+      const res = await testApi(selectedApi.id, params, testBodyMode === 'raw' ? testRawBody : undefined)
       setTestResult(res.data)
     } catch { toast.error('Test request failed') }
     finally { setTestLoading(false) }
@@ -794,8 +927,10 @@ export default function ApiProxy() {
     if (!validateRegister()) return
     registerMutation.mutate({
       httpMethod: regForm.httpMethod,
+      bodyMode: regForm.bodyMode,
       internalBaseUrl: regForm.internalBaseUrl,
-      requestBodyTemplate: regForm.requestBodyTemplate || undefined,
+      requestBodyTemplate: regForm.bodyMode === 'TEMPLATE' ? (regForm.requestBodyTemplate || undefined) : undefined,
+      samplePayload: regForm.bodyMode === 'PASSTHROUGH' ? (regForm.samplePayload || undefined) : undefined,
       name: regForm.name,
       publicPath: regForm.publicPath,
       description: regForm.description || undefined,
@@ -808,13 +943,15 @@ export default function ApiProxy() {
       upstreamAuthType: regForm.upstreamAuthType,
       upstreamAuthHeader: regForm.upstreamAuthType === 'API_KEY' ? regForm.upstreamAuthHeader : undefined,
       upstreamAuthValue: ['API_KEY', 'BEARER_TOKEN'].includes(regForm.upstreamAuthType) ? regForm.upstreamAuthValue : undefined,
-      upstreamAuthUrl: regForm.upstreamAuthType === 'OAUTH2_PASSWORD' ? regForm.upstreamAuthUrl : undefined,
+      upstreamAuthUrl: ['OAUTH2_PASSWORD', 'CUSTOM_TOKEN'].includes(regForm.upstreamAuthType) ? regForm.upstreamAuthUrl : undefined,
       upstreamAuthUsername: ['OAUTH2_PASSWORD', 'BASIC_AUTH'].includes(regForm.upstreamAuthType) ? regForm.upstreamAuthUsername : undefined,
       upstreamAuthPassword: ['OAUTH2_PASSWORD', 'BASIC_AUTH'].includes(regForm.upstreamAuthType) ? regForm.upstreamAuthPassword : undefined,
       upstreamClientId: regForm.upstreamAuthType === 'OAUTH2_PASSWORD' ? regForm.upstreamClientId || undefined : undefined,
       upstreamClientSecret: regForm.upstreamAuthType === 'OAUTH2_PASSWORD' ? regForm.upstreamClientSecret || undefined : undefined,
+      upstreamTokenField: regForm.upstreamAuthType === 'CUSTOM_TOKEN' ? (regForm.upstreamTokenField || 'token') : undefined,
       tags: regForm.tags.length > 0 ? regForm.tags : undefined,
-    } as Parameters<typeof registerApi>[0])
+      queryParams: regForm.queryParams,
+    } as Parameters<typeof registerApi>[0] & { queryParams: RegQueryParam[] })
   }
 
   function validateEdit(): boolean {
@@ -828,12 +965,15 @@ export default function ApiProxy() {
 
   function submitEdit() {
     if (!editingApi || !validateEdit()) return
+    saveApiMeta(editingApi.id, { bodyMode: editForm.bodyMode, samplePayload: editForm.samplePayload })
     updateMutation.mutate({
       id: editingApi.id,
       data: {
         httpMethod: editForm.httpMethod,
+        bodyMode: editForm.bodyMode,
         internalBaseUrl: editForm.internalBaseUrl,
-        requestBodyTemplate: editForm.requestBodyTemplate || undefined,
+        requestBodyTemplate: editForm.bodyMode === 'TEMPLATE' ? (editForm.requestBodyTemplate || undefined) : undefined,
+        samplePayload: editForm.bodyMode === 'PASSTHROUGH' ? (editForm.samplePayload || undefined) : undefined,
         name: editForm.name,
         description: editForm.description || undefined,
         exposedDomain: editForm.exposedDomain || undefined,
@@ -845,13 +985,16 @@ export default function ApiProxy() {
         upstreamAuthType: editForm.upstreamAuthType as import('../api/proxy').UpstreamAuthType,
         upstreamAuthHeader: editForm.upstreamAuthType === 'API_KEY' ? editForm.upstreamAuthHeader : undefined,
         upstreamAuthValue: ['API_KEY', 'BEARER_TOKEN'].includes(editForm.upstreamAuthType) && editForm.upstreamAuthValue ? editForm.upstreamAuthValue : undefined,
-        upstreamAuthUrl: editForm.upstreamAuthType === 'OAUTH2_PASSWORD' ? editForm.upstreamAuthUrl : undefined,
+        upstreamAuthUrl: ['OAUTH2_PASSWORD', 'CUSTOM_TOKEN'].includes(editForm.upstreamAuthType) ? editForm.upstreamAuthUrl : undefined,
         upstreamAuthUsername: ['OAUTH2_PASSWORD', 'BASIC_AUTH'].includes(editForm.upstreamAuthType) ? editForm.upstreamAuthUsername : undefined,
         upstreamAuthPassword: ['OAUTH2_PASSWORD', 'BASIC_AUTH'].includes(editForm.upstreamAuthType) && editForm.upstreamAuthPassword ? editForm.upstreamAuthPassword : undefined,
         upstreamClientId: editForm.upstreamAuthType === 'OAUTH2_PASSWORD' ? editForm.upstreamClientId || undefined : undefined,
         upstreamClientSecret: editForm.upstreamAuthType === 'OAUTH2_PASSWORD' && editForm.upstreamClientSecret ? editForm.upstreamClientSecret : undefined,
+        upstreamTokenField: editForm.upstreamAuthType === 'CUSTOM_TOKEN' ? (editForm.upstreamTokenField || 'token') : undefined,
         tags: editForm.tags,
       },
+      queryParams: editForm.queryParams,
+      originalQueryParams: editOriginalQueryParams,
     })
   }
 
@@ -908,7 +1051,8 @@ export default function ApiProxy() {
   const filteredApis = apis.filter(api => {
     const matchesEnv    = activeEnvTab === 'all' || api.environment === activeEnvTab
     const matchesSearch = !sidebarSearch || api.name.toLowerCase().includes(sidebarSearch.toLowerCase()) || api.publicPath.toLowerCase().includes(sidebarSearch.toLowerCase())
-    const matchesTag    = !activeTagFilter || (api.tags ?? []).includes(activeTagFilter)
+    // Multi-tag filter: OR within the tag facet (match any selected tag)
+    const matchesTag    = activeTagFilters.length === 0 || (api.tags ?? []).some(t => activeTagFilters.includes(t))
     return matchesEnv && matchesSearch && matchesTag
   })
   const apisTotalElements = filteredApis.length
@@ -924,16 +1068,127 @@ export default function ApiProxy() {
     })
   }, [apisData])
 
-  const sortedFilteredApis = [...filteredApis]
-    .sort((a, b) => {
-      const ai = apiOrder.indexOf(a.id)
-      const bi = apiOrder.indexOf(b.id)
-      if (ai === -1 && bi === -1) return 0
-      if (ai === -1) return 1
-      if (bi === -1) return -1
-      return ai - bi
-    })
-    .slice(apisPage * API_PAGE_SIZE, (apisPage + 1) * API_PAGE_SIZE)
+  // Persist sidebar view preferences across reloads
+  useEffect(() => { localStorage.setItem('pus-api-sort', sortMode) }, [sortMode])
+  useEffect(() => { localStorage.setItem('pus-api-group', groupByTag ? '1' : '0') }, [groupByTag])
+  useEffect(() => { localStorage.setItem('pus-api-collapsed-groups', JSON.stringify([...collapsedGroups])) }, [collapsedGroups])
+
+  const HEALTH_RANK: Record<string, number> = { DOWN: 0, DEGRADED: 1, UNKNOWN: 2, UP: 3 }
+  const sortedFiltered = [...filteredApis].sort((a, b) => {
+    if (sortMode === 'name')   return a.name.localeCompare(b.name)
+    if (sortMode === 'health') return (HEALTH_RANK[a.healthStatus] ?? 9) - (HEALTH_RANK[b.healthStatus] ?? 9) || a.name.localeCompare(b.name)
+    if (sortMode === 'recent') return (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '')
+    // manual — persisted drag order
+    const ai = apiOrder.indexOf(a.id)
+    const bi = apiOrder.indexOf(b.id)
+    if (ai === -1 && bi === -1) return 0
+    if (ai === -1) return 1
+    if (bi === -1) return -1
+    return ai - bi
+  })
+
+  // Flat mode: paginate. Grouped mode: render all, organised under collapsible tag groups.
+  const sortedFilteredApis = sortedFiltered.slice(apisPage * API_PAGE_SIZE, (apisPage + 1) * API_PAGE_SIZE)
+  const apiGroups: { key: string; tag: ProxyApiTag | null; apis: ProxyApi[] }[] = groupByTag
+    ? (() => {
+        const groups: { key: string; tag: ProxyApiTag | null; apis: ProxyApi[] }[] = allTags
+          .map(tag => ({ key: tag.name, tag, apis: sortedFiltered.filter(a => (a.tags ?? []).includes(tag.name)) }))
+          .filter(g => g.apis.length > 0)
+        const untagged = sortedFiltered.filter(a => !(a.tags ?? []).some(name => allTags.some(t => t.name === name)))
+        if (untagged.length) groups.push({ key: '__untagged__', tag: null, apis: untagged })
+        return groups
+      })()
+    : []
+  // Drag-reorder only makes sense in the flat, manually-sorted view.
+  const dragEnabled = !groupByTag && sortMode === 'manual'
+
+  const renderApiCard = (api: ProxyApi) => {
+    const active = selectedApi?.id === api.id
+    const isDragging = draggedId === api.id
+    const isDragOver = dragOverId === api.id
+    const apiTags = (api.tags ?? []).map(name => allTags.find(t => t.name === name)).filter(Boolean) as ProxyApiTag[]
+    return (
+      <div
+        key={api.id}
+        draggable={dragEnabled}
+        onDragStart={dragEnabled ? () => handleDragStart(api.id) : undefined}
+        onDragOver={dragEnabled ? e => handleDragOver(e, api.id) : undefined}
+        onDragEnd={dragEnabled ? handleDragEnd : undefined}
+        onDrop={dragEnabled ? () => handleDrop(api.id) : undefined}
+        onClick={() => { setSelectedApi(api); setDetailTab('overview'); setTestResult(null); setTestParams({}); setLogsPage(0); setLogsSearchInput(''); setLogsSearch(''); setReplaysPage(0) }}
+        style={{
+          padding: `10px 12px 10px ${dragEnabled ? 8 : 12}px`, cursor: 'pointer', transition: 'background 0.1s',
+          background: isDragOver ? `${ACCENT}14` : active ? (isDark ? `${ACCENT}18` : `${ACCENT}0c`) : 'transparent',
+          borderLeft: `3px solid ${isDragOver ? ACCENT : active ? ACCENT : 'transparent'}`,
+          borderTop: isDragOver ? `2px solid ${ACCENT}` : '2px solid transparent',
+          borderBottom: '1px solid var(--divider)',
+          opacity: isDragging ? 0.45 : 1,
+          display: 'flex', alignItems: 'flex-start', gap: 6,
+        }}
+      >
+        {/* Drag handle — only in flat + manual order */}
+        {dragEnabled && (
+          <div style={{ color: 'var(--txt-4)', paddingTop: 3, flexShrink: 0, cursor: 'grab' }} title="Drag to reorder" onClick={e => e.stopPropagation()}>
+            <GripVertical size={11} />
+          </div>
+        )}
+
+        <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
+
+          {/* Row 1: health dot + name + actions */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 4 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 }}>
+              <HealthDot status={api.healthStatus} />
+              <span title={api.name} style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {api.name}
+              </span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 1, flexShrink: 0 }} onClick={e => e.stopPropagation()}>
+              {!api.builtIn && <Btn variant="ghost" size="sm" icon={<Pencil size={11} />} iconOnly onClick={() => openEdit(api)} style={{ height: 20, padding: '0 4px', color: 'var(--txt-3)' }} />}
+              <Btn variant="ghost" size="sm" icon={<CopyPlus size={11} />} iconOnly onClick={() => openClone(api)} style={{ height: 20, padding: '0 4px', color: 'var(--txt-3)' }} />
+              {api.builtIn
+                ? <span title="Built-in APIs cannot be deleted" style={{ display: 'flex', alignItems: 'center', padding: '0 4px', color: 'var(--txt-4)', cursor: 'not-allowed' }}><Lock size={11} /></span>
+                : <Confirm title="Remove this API?" danger onConfirm={() => deleteMutation.mutate(api.id)}><Btn variant="danger" size="sm" icon={<Trash2 size={11} />} iconOnly style={{ height: 20, padding: '0 4px' }} /></Confirm>
+              }
+            </div>
+          </div>
+
+          {/* Row 2: method + path */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+            {api.httpMethod && <MethodChip method={api.httpMethod} />}
+            <span style={{ fontSize: 11, color: 'var(--txt-3)', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+              {api.publicPath}
+            </span>
+            {api.exposedDomain && <span title="Kong gateway configured" style={{ display: 'inline-flex', flexShrink: 0 }}><Globe size={9} color={ACCENT} /></span>}
+          </div>
+
+          {/* Row 3: status badges — fixed single line, no wrap */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 3, flexWrap: 'nowrap', overflow: 'hidden' }}>
+            {api.builtIn && <Tag color="accent" style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}>BUILT-IN</Tag>}
+            <Tag color={ENV_TAG_COLOR[api.environment] ?? 'muted'} style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}>{api.environment}</Tag>
+            <Tag color={api.status === 'ACTIVE' ? 'green' : 'muted'} style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}>
+              {api.status === 'ACTIVE' ? 'Active' : 'Inactive'}
+            </Tag>
+            {api.authRequired
+              ? <Tag color="blue" style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}><Lock size={8} style={{ display: 'inline', marginRight: 2 }} />Auth</Tag>
+              : <Tag color="muted" style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}><Unlock size={8} style={{ display: 'inline', marginRight: 2 }} />Open</Tag>
+            }
+            <Tag color={HEALTH_TAG_COLOR[api.healthStatus]} style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}>{api.healthStatus}</Tag>
+          </div>
+
+          {/* Row 4: API tags — only rendered when present */}
+          {apiTags.length > 0 && (
+            <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
+              {apiTags.map(t => (
+                <span key={t.id} style={{ fontSize: 9, fontWeight: 700, padding: '1px 6px', borderRadius: 10, background: `${t.color}20`, color: t.color, border: `1px solid ${t.color}40`, lineHeight: '14px', whiteSpace: 'nowrap' }}>{t.name}</span>
+              ))}
+            </div>
+          )}
+
+        </div>
+      </div>
+    )
+  }
 
   function handleDragStart(id: string) { setDraggedId(id) }
   function handleDragOver(e: React.DragEvent, id: string) { e.preventDefault(); if (id !== draggedId) setDragOverId(id) }
@@ -953,7 +1208,14 @@ export default function ApiProxy() {
     setDraggedId(null)
     setDragOverId(null)
   }
-  const callerParams = (parametersData ?? []).filter(p => p.paramSource === 'CALLER')
+  const callerParams      = (parametersData ?? []).filter(p => p.paramSource === 'CALLER')
+  const callerQueryParams = callerParams.filter(p => p.paramType === 'QUERY')
+  const callerPathParams  = callerParams.filter(p => p.paramType === 'PATH')
+  const callerBodyParams  = callerParams.filter(p => p.paramType === 'BODY')
+
+  // Derive body mode + sample payload, falling back to localStorage until backend returns them
+  const effectiveBodyMode    = selectedApi ? (selectedApi.bodyMode    ?? loadApiMeta(selectedApi.id).bodyMode    ?? 'PASSTHROUGH') as 'TEMPLATE' | 'PASSTHROUGH' : 'PASSTHROUGH'
+  const effectiveSamplePayload = selectedApi ? (selectedApi.samplePayload ?? loadApiMeta(selectedApi.id).samplePayload ?? null) : null
 
   const testPreviewUrl = useMemo(() => {
     if (!selectedApi) return ''
@@ -1024,15 +1286,29 @@ export default function ApiProxy() {
   const logColumns: Column<RequestLog>[] = [
     { key: 'method', title: 'Method', width: 80, render: (r) => <MethodChip method={r.method} /> },
     { key: 'path', title: 'Path', render: (r) => <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{r.path}</span> },
+    { key: 'partner', title: 'Partner', width: 130, render: (r) => r.partnerName
+      ? <Tag color="blue">{r.partnerName}</Tag>
+      : <span style={{ color: 'var(--muted)', fontSize: 11 }}>—</span>
+    },
     { key: 'status', title: 'Status', width: 76, render: (r) => {
       if (!r.statusCode) return <span>—</span>
       const c: 'green'|'orange'|'red' = r.statusCode < 300 ? 'green' : r.statusCode < 500 ? 'orange' : 'red'
       return <Tag color={c}>{r.statusCode}</Tag>
     }},
-    { key: 'latency', title: 'Latency', width: 90, render: (r) => r.responseTimeMs != null
-      ? <span style={{ color: r.responseTimeMs > 1000 ? 'var(--red)' : r.responseTimeMs > 300 ? 'var(--orange)' : 'var(--green)', fontSize: 12 }}>{r.responseTimeMs} ms</span>
-      : <span>—</span>
-    },
+    { key: 'latency', title: 'Latency', width: 110, render: (r) => {
+      // Primary = gateway-inclusive latency (Kong-receipt → response built, t2→t4).
+      // Falls back to the Spring-only time when no edge stamp was present.
+      const primary = r.gatewayLatencyMs ?? r.responseTimeMs
+      if (primary == null) return <span>—</span>
+      const showBackend = r.gatewayLatencyMs != null && r.responseTimeMs != null && r.gatewayLatencyMs !== r.responseTimeMs
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', lineHeight: 1.3 }}
+             title={showBackend ? `Gateway ${r.gatewayLatencyMs} ms (Kong→response) · Backend ${r.responseTimeMs} ms (incl. upstream) · edge +${r.gatewayLatencyMs! - r.responseTimeMs!} ms` : undefined}>
+          <span style={{ color: primary > 1000 ? 'var(--red)' : primary > 300 ? 'var(--orange)' : 'var(--green)', fontSize: 12 }}>{primary} ms</span>
+          {showBackend && <span style={{ fontSize: 10, color: 'var(--txt-3)' }}>be {r.responseTimeMs} ms</span>}
+        </div>
+      )
+    }},
     { key: 'ip', title: 'IP', width: 125, render: (r) => <span style={{ fontFamily: 'monospace', fontSize: 11 }}>{r.clientIp}</span> },
     { key: 'time', title: 'Time', width: 145, render: (r) => <span style={{ fontSize: 11 }}>{fmtTs(r.createdAt)}</span> },
     { key: 'reqBody', title: '', width: 32, render: (r) => {
@@ -1177,6 +1453,7 @@ export default function ApiProxy() {
     upstreamAuthPassword: string
     upstreamClientId: string
     upstreamClientSecret: string
+    upstreamTokenField: string
   }
 
   function renderAuthConditionals(
@@ -1212,6 +1489,14 @@ export default function ApiProxy() {
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 10px', marginTop: 8 }}>
           <Inp label="Client ID" value={form.upstreamClientId} onChangeValue={v => patchForm({ upstreamClientId: v })} placeholder="client_id" hint="Sent as client_id in the token request (optional)" style={{ fontFamily: 'monospace' }} />
           <Inp label="Client Secret" type="password" value={form.upstreamClientSecret} onChangeValue={v => patchForm({ upstreamClientSecret: v })} placeholder={isEdit ? 'leave blank to keep' : ''} hint="Sent as client_secret in the token request (optional)" />
+        </div>
+      </div>
+    )
+    if (authType === 'CUSTOM_TOKEN') return (
+      <div style={{ marginTop: 10 }}>
+        <Inp label="Token URL" value={form.upstreamAuthUrl} onChangeValue={v => patchForm({ upstreamAuthUrl: v })} placeholder="https://api.example.com/token?applicationId=..." hint="TAG POSTs to this URL (query params included) to obtain the token" style={{ fontFamily: 'monospace' }} />
+        <div style={{ marginTop: 8 }}>
+          <Inp label="Token Field" value={form.upstreamTokenField} onChangeValue={v => patchForm({ upstreamTokenField: v })} placeholder="token" hint={'JSON field name in the response that holds the token (e.g. "token" or "access_token")'} style={{ fontFamily: 'monospace' }} />
         </div>
       </div>
     )
@@ -1274,17 +1559,39 @@ export default function ApiProxy() {
             if (t === 'BEARER_TOKEN') return <Tag color="blue">Bearer Token (static)</Tag>
             if (t === 'BASIC_AUTH') return <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><Tag color="accent">Basic Auth</Tag><span style={{ fontFamily: 'monospace', fontSize: 11, color: 'var(--txt-2)' }}>{selectedApi.upstreamAuthUsername}</span></span>
             if (t === 'OAUTH2_PASSWORD') return <span style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}><Tag color="orange">OAuth2 Password</Tag><span style={{ fontFamily: 'monospace', fontSize: 11, color: 'var(--txt-2)' }}>{selectedApi.upstreamAuthUsername} @ {selectedApi.upstreamAuthUrl}</span></span>
+            if (t === 'CUSTOM_TOKEN') return <span style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}><Tag color="blue">Custom Token</Tag><span style={{ fontFamily: 'monospace', fontSize: 11, color: 'var(--txt-2)' }}>{selectedApi.upstreamAuthUrl}</span><code style={{ fontSize: 10, background: 'var(--surface-2)', padding: '1px 6px', borderRadius: 4 }}>field: {selectedApi.upstreamTokenField ?? 'token'}</code></span>
             return <Tag color="muted">{t}</Tag>
           })()}
         </div>
 
-        {/* Request body template */}
-        {selectedApi.requestBodyTemplate && (
+        {/* Body mode + template */}
+        {['POST', 'PUT', 'PATCH'].includes(selectedApi.httpMethod ?? '') && (
           <div style={{ padding: '10px 14px', ...cardStyle, marginBottom: 10 }}>
-            <div style={{ fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px', color: 'var(--txt-3)', marginBottom: 6 }}>Request Body Template</div>
-            <pre style={{ margin: 0, fontSize: 11, fontFamily: 'monospace', background: panelBg, padding: '8px 10px', borderRadius: 6, maxHeight: 160, overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all', color: 'var(--txt-1)' }}>
-              {selectedApi.requestBodyTemplate}
-            </pre>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: effectiveBodyMode === 'TEMPLATE' && selectedApi.requestBodyTemplate ? 8 : 0 }}>
+              <div style={{ fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px', color: 'var(--txt-3)' }}>Body Mode</div>
+              <span style={{ fontSize: 11, fontWeight: 700, padding: '2px 10px', borderRadius: 10, background: effectiveBodyMode === 'PASSTHROUGH' ? '#e0f2fe' : '#ede9fe', color: effectiveBodyMode === 'PASSTHROUGH' ? '#0369a1' : '#6d28d9' }}>
+                {effectiveBodyMode === 'PASSTHROUGH' ? 'Passthrough' : 'Template'}
+              </span>
+            </div>
+            {effectiveBodyMode === 'TEMPLATE' && selectedApi.requestBodyTemplate && (
+              <pre style={{ margin: 0, fontSize: 11, fontFamily: 'monospace', background: panelBg, padding: '8px 10px', borderRadius: 6, maxHeight: 160, overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all', color: 'var(--txt-1)' }}>
+                {selectedApi.requestBodyTemplate}
+              </pre>
+            )}
+            {effectiveBodyMode === 'PASSTHROUGH' && effectiveSamplePayload && (
+              <div style={{ marginTop: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                  <span style={{ fontSize: 10, color: 'var(--txt-3)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Sample Payload</span>
+                  <div style={{ display: 'flex', gap: 4 }}>
+                    <button type="button" onClick={() => copyToClipboard(effectiveSamplePayload)} style={{ display: 'flex', alignItems: 'center', padding: '2px 5px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--txt-3)', cursor: 'pointer' }}><Copy size={10} /></button>
+                    <button type="button" onClick={() => setBodyModal({ title: 'Sample Payload', body: effectiveSamplePayload })} style={{ display: 'flex', alignItems: 'center', padding: '2px 5px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--txt-3)', cursor: 'pointer' }}><Maximize2 size={10} /></button>
+                  </div>
+                </div>
+                <pre style={{ margin: 0, fontSize: 11, fontFamily: 'monospace', background: panelBg, padding: '8px 10px', borderRadius: 6, maxHeight: 200, overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all', color: 'var(--txt-1)' }}>
+                  {effectiveSamplePayload}
+                </pre>
+              </div>
+            )}
           </div>
         )}
 
@@ -1360,32 +1667,130 @@ export default function ApiProxy() {
           </div>
 
           <div style={{ flex: 1, overflowY: 'auto', padding: '12px 14px 24px' }}>
-            {callerParams.length > 0 && (
-              <div style={{ marginBottom: 12 }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-                  <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--txt-3)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Parameters</div>
-                  {Object.values(testParams).some(v => v !== '') && (
-                    <button onClick={() => { const cleared = Object.fromEntries(callerParams.map(p => [p.paramName, ''])); setTestParams(cleared); if (selectedApi) persistTestParams(selectedApi.id, cleared) }} style={{ fontSize: 10, fontWeight: 600, color: 'var(--red)', background: 'none', border: 'none', cursor: 'pointer', padding: '1px 4px' }}>Clear</button>
+            {/* Query Params */}
+            {callerQueryParams.length > 0 && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Query Params</span>
+                    <code style={{ fontSize: 10, background: 'var(--accent)18', color: 'var(--accent)', padding: '1px 6px', borderRadius: 4, border: '1px solid var(--accent)30' }}>?key=val</code>
+                  </div>
+                  {callerQueryParams.some(p => testParams[p.paramName]) && (
+                    <button onClick={() => { const cleared = { ...testParams, ...Object.fromEntries(callerQueryParams.map(p => [p.paramName, ''])) }; setTestParams(cleared); if (selectedApi) persistTestParams(selectedApi.id, cleared) }} style={{ fontSize: 10, fontWeight: 600, color: 'var(--red)', background: 'none', border: 'none', cursor: 'pointer' }}>Clear</button>
                   )}
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '8px 12px' }}>
-                  {callerParams.map(p => (
-                    <div key={p.id}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 3 }}>
-                        <code style={{ fontSize: 11, fontWeight: 600, color: 'var(--txt-1)', background: 'var(--surface-2)', padding: '1px 6px', borderRadius: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 120 }}>{p.paramName}</code>
-                        {p.required && <span style={{ fontSize: 9, color: 'var(--red)', fontWeight: 700, flexShrink: 0 }}>required</span>}
-                        {p.description && <span style={{ fontSize: 10, color: 'var(--txt-3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.description}</span>}
+                <div style={{ border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '140px 1fr', fontSize: 10, fontWeight: 700, color: 'var(--txt-3)', textTransform: 'uppercase', letterSpacing: '0.5px', padding: '5px 10px', background: 'var(--surface-2)', borderBottom: '1px solid var(--border)' }}>
+                    <span>Key</span><span>Value</span>
+                  </div>
+                  {callerQueryParams.map((p, i) => (
+                    <div key={p.id} style={{ display: 'grid', gridTemplateColumns: '140px 1fr', alignItems: 'center', borderTop: i > 0 ? '1px solid var(--border)' : undefined }}>
+                      <div style={{ padding: '6px 10px', display: 'flex', alignItems: 'center', gap: 5, borderRight: '1px solid var(--border)' }}>
+                        <code style={{ fontSize: 11, fontWeight: 600, color: 'var(--txt-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.paramName}</code>
+                        {p.required && <span style={{ fontSize: 9, color: 'var(--red)', fontWeight: 700, flexShrink: 0 }}>*</span>}
                       </div>
                       <input
                         className="pus-input"
-                        placeholder={`Enter ${p.paramName}`}
+                        placeholder={`value`}
                         value={testParams[p.paramName] ?? ''}
                         onChange={e => { setTestParams(prev => ({ ...prev, [p.paramName]: e.target.value })); if (testParamErrors[p.paramName]) setTestParamErrors(prev => ({ ...prev, [p.paramName]: false })) }}
-                        style={{ fontFamily: 'monospace', width: '100%', boxSizing: 'border-box', ...(testParamErrors[p.paramName] ? { borderColor: 'var(--red)', outline: '1px solid var(--red)' } : {}) }}
+                        style={{ fontFamily: 'monospace', border: 'none', borderRadius: 0, outline: 'none', boxShadow: 'none', width: '100%', boxSizing: 'border-box', background: 'transparent', ...(testParamErrors[p.paramName] ? { background: '#fef2f2' } : {}) }}
                       />
                     </div>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {/* Path Params */}
+            {callerPathParams.length > 0 && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: '#f97316', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Path Params</span>
+                  <code style={{ fontSize: 10, background: '#f9731615', color: '#f97316', padding: '1px 6px', borderRadius: 4, border: '1px solid #f9731630' }}>{'/{{param}}'}</code>
+                </div>
+                <div style={{ border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '140px 1fr', fontSize: 10, fontWeight: 700, color: 'var(--txt-3)', textTransform: 'uppercase', letterSpacing: '0.5px', padding: '5px 10px', background: 'var(--surface-2)', borderBottom: '1px solid var(--border)' }}>
+                    <span>Key</span><span>Value</span>
+                  </div>
+                  {callerPathParams.map((p, i) => (
+                    <div key={p.id} style={{ display: 'grid', gridTemplateColumns: '140px 1fr', alignItems: 'center', borderTop: i > 0 ? '1px solid var(--border)' : undefined }}>
+                      <div style={{ padding: '6px 10px', display: 'flex', alignItems: 'center', gap: 5, borderRight: '1px solid var(--border)' }}>
+                        <code style={{ fontSize: 11, fontWeight: 600, color: 'var(--txt-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.paramName}</code>
+                        {p.required && <span style={{ fontSize: 9, color: 'var(--red)', fontWeight: 700, flexShrink: 0 }}>*</span>}
+                      </div>
+                      <input
+                        className="pus-input"
+                        placeholder={`value`}
+                        value={testParams[p.paramName] ?? ''}
+                        onChange={e => { setTestParams(prev => ({ ...prev, [p.paramName]: e.target.value })); if (testParamErrors[p.paramName]) setTestParamErrors(prev => ({ ...prev, [p.paramName]: false })) }}
+                        style={{ fontFamily: 'monospace', border: 'none', borderRadius: 0, outline: 'none', boxShadow: 'none', width: '100%', boxSizing: 'border-box', background: 'transparent', ...(testParamErrors[p.paramName] ? { background: '#fef2f2' } : {}) }}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Body — Params / Raw toggle */}
+            {(callerBodyParams.length > 0 || selectedApi.requestBodyTemplate) && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--txt-3)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Body</span>
+                    {/* Params / Raw toggle */}
+                    <div style={{ display: 'flex', borderRadius: 6, border: '1px solid var(--border)', overflow: 'hidden' }}>
+                      {(['params', 'raw'] as const).map(mode => (
+                        <button key={mode} onClick={() => setTestBodyMode(mode)} style={{
+                          padding: '2px 10px', fontSize: 10, fontWeight: 600, cursor: 'pointer', border: 'none',
+                          background: testBodyMode === mode ? ACCENT : 'var(--surface-2)',
+                          color: testBodyMode === mode ? '#fff' : 'var(--txt-3)',
+                          textTransform: 'capitalize',
+                        }}>{mode === 'raw' ? 'Raw' : 'Params'}</button>
+                      ))}
+                    </div>
+                  </div>
+                  {testBodyMode === 'params' && callerBodyParams.some(p => testParams[p.paramName]) && (
+                    <button onClick={() => { const cleared = { ...testParams, ...Object.fromEntries(callerBodyParams.map(p => [p.paramName, ''])) }; setTestParams(cleared); if (selectedApi) persistTestParams(selectedApi.id, cleared) }} style={{ fontSize: 10, fontWeight: 600, color: 'var(--red)', background: 'none', border: 'none', cursor: 'pointer' }}>Clear</button>
+                  )}
+                  {testBodyMode === 'raw' && testRawBody && (
+                    <button onClick={() => setTestRawBody('')} style={{ fontSize: 10, fontWeight: 600, color: 'var(--red)', background: 'none', border: 'none', cursor: 'pointer' }}>Clear</button>
+                  )}
+                </div>
+
+                {testBodyMode === 'params' && callerBodyParams.length > 0 && (
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '8px 12px' }}>
+                    {callerBodyParams.map(p => (
+                      <div key={p.id}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 3 }}>
+                          <code style={{ fontSize: 11, fontWeight: 600, color: 'var(--txt-1)', background: 'var(--surface-2)', padding: '1px 6px', borderRadius: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 120 }}>{p.paramName}</code>
+                          {p.required && <span style={{ fontSize: 9, color: 'var(--red)', fontWeight: 700, flexShrink: 0 }}>required</span>}
+                          {p.description && <span style={{ fontSize: 10, color: 'var(--txt-3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.description}</span>}
+                        </div>
+                        <input
+                          className="pus-input"
+                          placeholder={`Enter ${p.paramName}`}
+                          value={testParams[p.paramName] ?? ''}
+                          onChange={e => { setTestParams(prev => ({ ...prev, [p.paramName]: e.target.value })); if (testParamErrors[p.paramName]) setTestParamErrors(prev => ({ ...prev, [p.paramName]: false })) }}
+                          style={{ fontFamily: 'monospace', width: '100%', boxSizing: 'border-box', ...(testParamErrors[p.paramName] ? { borderColor: 'var(--red)', outline: '1px solid var(--red)' } : {}) }}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {testBodyMode === 'raw' && (
+                  <div>
+                    <textarea
+                      className="pus-textarea"
+                      rows={12}
+                      value={testRawBody}
+                      onChange={e => setTestRawBody(e.target.value)}
+                      placeholder={'Paste your full JSON payload here.\n\n{{$guid}}, {{$timestamp}}, and any AUTO_TIMESTAMP / AUTO_UUID params defined in the Parameters tab are still substituted automatically.'}
+                      style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 11, width: '100%', boxSizing: 'border-box', resize: 'vertical' }}
+                    />
+                  </div>
+                )}
               </div>
             )}
 
@@ -1420,7 +1825,7 @@ export default function ApiProxy() {
             )}
 
             {!selectedApi.requestBodyTemplate && !callerParams.length && (
-              <Alert type="info" description="No parameters defined. Define them in the Parameters tab to enable body building." />
+              <Alert type="info" description="No parameters defined. Add Query Params, Path Params, or Body params in the Parameters tab." />
             )}
 
             {selectedApi.requestBodyTemplate && (
@@ -1734,6 +2139,47 @@ export default function ApiProxy() {
     icon: <History size={12} />,
     children: selectedApi ? (
       <div style={{ padding: '8px 12px', background: panelBg, height: '100%', display: 'flex', flexDirection: 'column', boxSizing: 'border-box' }}>
+        {/* Latency timeline info toggle */}
+        <div style={{ marginBottom: 8, display: 'flex', justifyContent: 'flex-end' }}>
+          <button onClick={() => setShowLatencyInfo(v => !v)} title="What are the T's?" style={{ display: 'flex', alignItems: 'center', gap: 4, background: 'none', border: 'none', cursor: 'pointer', color: showLatencyInfo ? (isDark ? '#93c5fd' : '#1d4ed8') : 'var(--txt-3)', fontSize: 11, padding: '2px 4px', borderRadius: 4 }}>
+            <Info size={13} />
+            <span>What are the T's?</span>
+          </button>
+        </div>
+        {showLatencyInfo && (
+          <div style={{ marginBottom: 10, padding: '10px 14px', background: isDark ? '#1a2035' : '#f0f4ff', border: `1px solid ${isDark ? '#2a3a5c' : '#c7d7f8'}`, borderRadius: 8, fontSize: 12, color: 'var(--txt-2)', lineHeight: 1.7 }}>
+            <div style={{ fontWeight: 600, color: 'var(--txt-1)', marginBottom: 4 }}>What are the T's? — how Latency is measured</div>
+            <div>
+              The <strong>LATENCY</strong> column shows two numbers per request: the <strong>gateway</strong> time (top) and{' '}
+              <code style={{ fontSize: 10, fontWeight: 700, background: isDark ? '#2a3a5c' : '#dbeafe', color: isDark ? '#93c5fd' : '#1d4ed8', padding: '1px 5px', borderRadius: 3 }}>be</code> = the <strong>backend</strong> time (below).
+              Each <em>t</em> is a point on the request's journey through the stack:
+            </div>
+            <div style={{ margin: '8px 0', display: 'flex', flexDirection: 'column', gap: 2 }}>
+              {[
+                { t: 't0',  where: 'Client sends request',           mark: '',                          dim: true },
+                { t: 't1',  where: 'Cloudflare receives',            mark: '',                          dim: true },
+                { t: 't1b', where: 'Apache receives',                mark: '',                          dim: true },
+                { t: 't2',  where: 'Kong receives',                  mark: 'gateway timer STARTS',      hl: true },
+                { t: 't3',  where: 'TAG / Spring receives',          mark: 'backend (be) timer STARTS', hl: false },
+                { t: 't4',  where: 'TAG finishes building response', mark: 'both timers STOP',          hl: true },
+                { t: 't5',  where: 'Client receives response',       mark: '',                          dim: true },
+              ].map(r => (
+                <div key={r.t} style={{ display: 'flex', alignItems: 'baseline', gap: 8, opacity: r.dim ? 0.5 : 1 }}>
+                  <code style={{ fontSize: 10, fontWeight: 700, minWidth: 30, textAlign: 'center', padding: '1px 5px', borderRadius: 3, background: r.hl ? '#1d4ed8' : (isDark ? '#2a3a5c' : '#dbeafe'), color: r.hl ? 'white' : (isDark ? '#93c5fd' : '#1d4ed8') }}>{r.t}</code>
+                  <span style={{ color: 'var(--txt-2)' }}>{r.where}</span>
+                  {r.mark && <span style={{ fontSize: 10, color: 'var(--txt-3)', fontStyle: 'italic' }}>◄ {r.mark}</span>}
+                </div>
+              ))}
+            </div>
+            <div>
+              <div><strong>Gateway</strong> (top number) = <code style={{ fontSize: 10, fontWeight: 700, background: isDark ? '#2a3a5c' : '#dbeafe', color: isDark ? '#93c5fd' : '#1d4ed8', padding: '1px 5px', borderRadius: 3 }}>t2 → t4</code> — from Kong receiving the request to TAG finishing the response. Includes the Kong→TAG hop, backend processing, and the upstream round-trip. <strong>This is what we measure today.</strong></div>
+              <div style={{ marginTop: 2 }}><code style={{ fontSize: 10, fontWeight: 700, background: isDark ? '#2a3a5c' : '#dbeafe', color: isDark ? '#93c5fd' : '#1d4ed8', padding: '1px 5px', borderRadius: 3 }}>be</code> <strong>Backend</strong> = <code style={{ fontSize: 10, fontWeight: 700, background: isDark ? '#2a3a5c' : '#dbeafe', color: isDark ? '#93c5fd' : '#1d4ed8', padding: '1px 5px', borderRadius: 3 }}>t3 → t4</code> — TAG's own time (processing + upstream). The difference <em>gateway − be</em> is the Kong→TAG edge overhead.</div>
+            </div>
+            <div style={{ marginTop: 6, color: 'var(--txt-3)', fontSize: 11 }}>
+              Not captured: the client↔edge legs (t0→t1 and t4→t5, including all response egress) — those are only visible to the browser or Cloudflare, not the backend.
+            </div>
+          </div>
+        )}
         <div style={{ position: 'relative', marginBottom: 8 }}>
           <Search size={13} style={{ position: 'absolute', left: 9, top: '50%', transform: 'translateY(-50%)', color: 'var(--txt-3)', pointerEvents: 'none' }} />
           <input
@@ -2429,29 +2875,36 @@ export default function ApiProxy() {
           {/* Tag filter chips */}
           {allTags.length > 0 && (() => {
             const TAG_LIMIT = 8
-            const activeIdx = activeTagFilter ? allTags.findIndex(t => t.name === activeTagFilter) : -1
+            const activeIdx = activeTagFilters.length ? Math.max(...activeTagFilters.map(n => allTags.findIndex(t => t.name === n))) : -1
             const forceExpand = activeIdx >= TAG_LIMIT
             const expanded = tagChipsExpanded || forceExpand
             const visible = expanded ? allTags : allTags.slice(0, TAG_LIMIT)
             const hiddenCount = allTags.length - TAG_LIMIT
+            const toggleTag = (name: string) => {
+              setActiveTagFilters(prev => prev.includes(name) ? prev.filter(t => t !== name) : [...prev, name])
+              setApisPage(0)
+            }
             return (
               <div style={{ padding: '6px 10px', borderBottom: '1px solid var(--border)', background: headerBg, flexShrink: 0, display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
                 <button
-                  onClick={() => setActiveTagFilter(null)}
-                  style={{ fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 10, border: `1px solid ${!activeTagFilter ? ACCENT : 'var(--border)'}`, background: !activeTagFilter ? `${ACCENT}18` : 'transparent', color: !activeTagFilter ? ACCENT : 'var(--txt-3)', cursor: 'pointer' }}
+                  onClick={() => { setActiveTagFilters([]); setApisPage(0) }}
+                  style={{ fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 10, border: `1px solid ${activeTagFilters.length === 0 ? ACCENT : 'var(--border)'}`, background: activeTagFilters.length === 0 ? `${ACCENT}18` : 'transparent', color: activeTagFilters.length === 0 ? ACCENT : 'var(--txt-3)', cursor: 'pointer' }}
                 >
                   All
                 </button>
-                {visible.map(tag => (
+                {visible.map(tag => {
+                  const on = activeTagFilters.includes(tag.name)
+                  return (
                   <button
                     key={tag.id}
-                    onClick={() => { setActiveTagFilter(activeTagFilter === tag.name ? null : tag.name); setApisPage(0) }}
+                    onClick={() => toggleTag(tag.name)}
                     title={tag.description ?? tag.name}
-                    style={{ fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 10, border: `1px solid ${activeTagFilter === tag.name ? tag.color : 'var(--border)'}`, background: activeTagFilter === tag.name ? `${tag.color}20` : 'transparent', color: activeTagFilter === tag.name ? tag.color : 'var(--txt-3)', cursor: 'pointer', transition: 'all 0.15s' }}
+                    style={{ fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 10, border: `1px solid ${on ? tag.color : 'var(--border)'}`, background: on ? `${tag.color}20` : 'transparent', color: on ? tag.color : 'var(--txt-3)', cursor: 'pointer', transition: 'all 0.15s' }}
                   >
                     {tag.name}
                   </button>
-                ))}
+                  )
+                })}
                 {hiddenCount > 0 && (
                   <button
                     onClick={() => setTagChipsExpanded(e => !e)}
@@ -2480,6 +2933,30 @@ export default function ApiProxy() {
             </div>
           )}
 
+          {/* Sort + group controls */}
+          <div style={{ padding: '6px 10px', borderBottom: '1px solid var(--border)', background: headerBg, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ fontSize: 10, color: 'var(--txt-3)', textTransform: 'uppercase', letterSpacing: '0.4px' }}>Sort</span>
+            <select
+              value={sortMode}
+              onChange={e => { setSortMode(e.target.value as typeof sortMode); setApisPage(0) }}
+              style={{ fontSize: 11, padding: '3px 6px', borderRadius: 6, border: '1px solid var(--border)', background: isDark ? '#1e2a3a' : '#f8fafc', color: 'var(--txt-1)', outline: 'none', cursor: 'pointer' }}
+            >
+              <option value="manual">Custom order</option>
+              <option value="name">Name (A–Z)</option>
+              <option value="health">Health</option>
+              <option value="recent">Recently updated</option>
+            </select>
+            {allTags.length > 0 && (
+              <button
+                onClick={() => setGroupByTag(v => !v)}
+                title="Group APIs by tag"
+                style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, fontWeight: 600, padding: '3px 8px', borderRadius: 6, border: `1px solid ${groupByTag ? ACCENT : 'var(--border)'}`, background: groupByTag ? `${ACCENT}18` : 'transparent', color: groupByTag ? ACCENT : 'var(--txt-3)', cursor: 'pointer' }}
+              >
+                <Tags size={11} /> Group by tag
+              </button>
+            )}
+          </div>
+
           {/* List body */}
           <div style={{ flex: 1, overflowY: 'auto', background: leftBg }}>
             {apisLoading && (
@@ -2492,93 +2969,36 @@ export default function ApiProxy() {
                 <div style={{ fontSize: 11, lineHeight: 1.5 }}>Click "Register API" to add your first proxied endpoint</div>
               </div>
             )}
-            {!apisLoading && sortedFilteredApis.length === 0 && apis.length > 0 && (
+            {!apisLoading && filteredApis.length === 0 && apis.length > 0 && (
               <div style={{ padding: '24px 16px', textAlign: 'center', color: 'var(--txt-3)', fontSize: 12 }}>
-                No APIs match your search{activeTagFilter ? ` or tag "${activeTagFilter}"` : ''}.
+                No APIs match your search{activeTagFilters.length ? ` or tag${activeTagFilters.length > 1 ? 's' : ''} ${activeTagFilters.map(t => `"${t}"`).join(', ')}` : ''}.
               </div>
             )}
-            {!apisLoading && sortedFilteredApis.map(api => {
-              const active = selectedApi?.id === api.id
-              const isDragging = draggedId === api.id
-              const isDragOver = dragOverId === api.id
-              const apiTags = (api.tags ?? []).map(name => allTags.find(t => t.name === name)).filter(Boolean) as ProxyApiTag[]
+
+            {/* Flat view (paginated) */}
+            {!apisLoading && !groupByTag && sortedFilteredApis.map(renderApiCard)}
+
+            {/* Grouped-by-tag view (collapsible, all groups shown) */}
+            {!apisLoading && groupByTag && apiGroups.map(group => {
+              const collapsed = collapsedGroups.has(group.key)
+              const color = group.tag?.color ?? '#94a3b8'
+              const label = group.tag ? group.tag.name : 'Untagged'
               return (
-                <div
-                  key={api.id}
-                  draggable
-                  onDragStart={() => handleDragStart(api.id)}
-                  onDragOver={e => handleDragOver(e, api.id)}
-                  onDragEnd={handleDragEnd}
-                  onDrop={() => handleDrop(api.id)}
-                  onClick={() => { setSelectedApi(api); setDetailTab('overview'); setTestResult(null); setTestParams({}); setLogsPage(0); setLogsSearchInput(''); setLogsSearch(''); setReplaysPage(0) }}
-                  style={{
-                    padding: '10px 12px 10px 8px', cursor: 'pointer', transition: 'background 0.1s',
-                    background: isDragOver ? `${ACCENT}14` : active ? (isDark ? `${ACCENT}18` : `${ACCENT}0c`) : 'transparent',
-                    borderLeft: `3px solid ${isDragOver ? ACCENT : active ? ACCENT : 'transparent'}`,
-                    borderTop: isDragOver ? `2px solid ${ACCENT}` : '2px solid transparent',
-                    borderBottom: '1px solid var(--divider)',
-                    opacity: isDragging ? 0.45 : 1,
-                    display: 'flex', alignItems: 'flex-start', gap: 6,
-                  }}
-                >
-                  {/* Drag handle */}
-                  <div style={{ color: 'var(--txt-4)', paddingTop: 3, flexShrink: 0, cursor: 'grab' }} title="Drag to reorder" onClick={e => e.stopPropagation()}>
-                    <GripVertical size={11} />
-                  </div>
-
-                  <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
-
-                    {/* Row 1: health dot + name + actions */}
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 4 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 }}>
-                        <HealthDot status={api.healthStatus} />
-                        <span title={api.name} style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          {api.name}
-                        </span>
-                      </div>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 1, flexShrink: 0 }} onClick={e => e.stopPropagation()}>
-                        {!api.builtIn && <Btn variant="ghost" size="sm" icon={<Pencil size={11} />} iconOnly onClick={() => openEdit(api)} style={{ height: 20, padding: '0 4px', color: 'var(--txt-3)' }} />}
-                        <Btn variant="ghost" size="sm" icon={<CopyPlus size={11} />} iconOnly onClick={() => openClone(api)} style={{ height: 20, padding: '0 4px', color: 'var(--txt-3)' }} />
-                        {api.builtIn
-                          ? <span title="Built-in APIs cannot be deleted" style={{ display: 'flex', alignItems: 'center', padding: '0 4px', color: 'var(--txt-4)', cursor: 'not-allowed' }}><Lock size={11} /></span>
-                          : <Confirm title="Remove this API?" danger onConfirm={() => deleteMutation.mutate(api.id)}><Btn variant="danger" size="sm" icon={<Trash2 size={11} />} iconOnly style={{ height: 20, padding: '0 4px' }} /></Confirm>
-                        }
-                      </div>
-                    </div>
-
-                    {/* Row 2: method + path */}
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-                      {api.httpMethod && <MethodChip method={api.httpMethod} />}
-                      <span style={{ fontSize: 11, color: 'var(--txt-3)', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-                        {api.publicPath}
-                      </span>
-                      {api.exposedDomain && <span title="Kong gateway configured" style={{ display: 'inline-flex', flexShrink: 0 }}><Globe size={9} color={ACCENT} /></span>}
-                    </div>
-
-                    {/* Row 3: status badges — fixed single line, no wrap */}
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 3, flexWrap: 'nowrap', overflow: 'hidden' }}>
-                      {api.builtIn && <Tag color="accent" style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}>BUILT-IN</Tag>}
-                      <Tag color={ENV_TAG_COLOR[api.environment] ?? 'muted'} style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}>{api.environment}</Tag>
-                      <Tag color={api.status === 'ACTIVE' ? 'green' : 'muted'} style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}>
-                        {api.status === 'ACTIVE' ? 'Active' : 'Inactive'}
-                      </Tag>
-                      {api.authRequired
-                        ? <Tag color="blue" style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}><Lock size={8} style={{ display: 'inline', marginRight: 2 }} />Auth</Tag>
-                        : <Tag color="muted" style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}><Unlock size={8} style={{ display: 'inline', marginRight: 2 }} />Open</Tag>
-                      }
-                      <Tag color={HEALTH_TAG_COLOR[api.healthStatus]} style={{ fontSize: 9, padding: '0 5px', lineHeight: '14px', margin: 0, flexShrink: 0 }}>{api.healthStatus}</Tag>
-                    </div>
-
-                    {/* Row 4: API tags — only rendered when present */}
-                    {apiTags.length > 0 && (
-                      <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
-                        {apiTags.map(t => (
-                          <span key={t.id} style={{ fontSize: 9, fontWeight: 700, padding: '1px 6px', borderRadius: 10, background: `${t.color}20`, color: t.color, border: `1px solid ${t.color}40`, lineHeight: '14px', whiteSpace: 'nowrap' }}>{t.name}</span>
-                        ))}
-                      </div>
-                    )}
-
-                  </div>
+                <div key={group.key}>
+                  <button
+                    onClick={() => setCollapsedGroups(prev => {
+                      const next = new Set(prev)
+                      if (next.has(group.key)) next.delete(group.key); else next.add(group.key)
+                      return next
+                    })}
+                    style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 7, padding: '6px 10px', background: isDark ? '#141c2e' : '#eef2f9', border: 'none', borderTop: '1px solid var(--border)', borderBottom: '1px solid var(--border)', cursor: 'pointer', position: 'sticky', top: 0, zIndex: 1 }}
+                  >
+                    <span style={{ fontSize: 9, color: 'var(--txt-3)', transform: collapsed ? 'rotate(-90deg)' : 'none', transition: 'transform 0.15s' }}>▼</span>
+                    <span style={{ width: 8, height: 8, borderRadius: '50%', background: color, flexShrink: 0 }} />
+                    <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--txt-2)', textTransform: 'uppercase', letterSpacing: '0.4px', flex: 1, textAlign: 'left' }}>{label}</span>
+                    <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--txt-3)', background: 'var(--surface-2)', borderRadius: 9, padding: '0 6px', minWidth: 18, textAlign: 'center' }}>{group.apis.length}</span>
+                  </button>
+                  {!collapsed && group.apis.map(renderApiCard)}
                 </div>
               )
             })}
@@ -2593,7 +3013,9 @@ export default function ApiProxy() {
             <span style={{ fontSize: 11, color: 'var(--txt-3)', whiteSpace: 'nowrap' }}>
               {apisTotalElements} API{apisTotalElements !== 1 ? 's' : ''}
               {activeEnvTab !== 'all' ? ` · ${activeEnvTab}` : ''}
+              {groupByTag ? ` · ${apiGroups.length} group${apiGroups.length !== 1 ? 's' : ''}` : ''}
             </span>
+            {!groupByTag && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
               <button
                 onClick={() => setApisPage(p => Math.max(0, p - 1))}
@@ -2613,6 +3035,7 @@ export default function ApiProxy() {
                 →
               </button>
             </div>
+            )}
           </div>
         </div>
 
@@ -2832,25 +3255,97 @@ export default function ApiProxy() {
               style={{ fontFamily: 'monospace' }}
             />
 
-            {['POST', 'PUT', 'PATCH'].includes(regForm.httpMethod) && (
-              <div style={{ borderTop: `1px dashed var(--border)`, paddingTop: 16 }}>
-                <Field
-                  label={<span>Request Body Template <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--txt-3)' }}>— optional, use <code style={{ background: 'var(--surface-2)', padding: '0 4px', borderRadius: 3 }}>{'{{param}}'}</code></span></span>}
-                  hint="Placeholders are substituted at request time. Leave blank to forward the caller's body as-is."
-                >
-                  <textarea className="pus-textarea" rows={5} value={regForm.requestBodyTemplate}
-                    onChange={e => setRegForm(f => ({ ...f, requestBodyTemplate: e.target.value }))}
-                    placeholder={'{\n  "txVersion": "1.1.0",\n  "txGuid": "{{$guid}}",\n  "vrn": "{{vrn}}",\n  "amount": {{amount}}\n}'}
-                    style={{ fontFamily: 'monospace', fontSize: 12, width: '100%' }} />
-                </Field>
-                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
-                  {['{{$guid}}', '{{$timestamp}}', '{{$isoDate}}'].map(b => (
-                    <code key={b} style={{ fontSize: 10, background: 'var(--surface-2)', padding: '2px 7px', borderRadius: 5, border: '1px solid var(--border)', color: 'var(--txt-2)', cursor: 'pointer' }}
-                      onClick={() => setRegForm(f => ({ ...f, requestBodyTemplate: (f.requestBodyTemplate || '') + b }))}
-                    >{b}</code>
-                  ))}
-                  <span style={{ fontSize: 10, color: 'var(--txt-3)', alignSelf: 'center' }}>click to insert</span>
+            {/* Query Params */}
+            <div style={{ borderTop: '1px dashed var(--border)', paddingTop: 16 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--txt-1)', marginBottom: 2 }}>
+                    Query Params <span style={{ fontWeight: 400, color: 'var(--txt-3)', fontSize: 11 }}>— optional</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--txt-3)' }}>Define the query parameters this API expects — appended to the URL as <code style={{ fontFamily: 'monospace' }}>?key=value</code></div>
                 </div>
+                <Btn size="sm" icon={<Plus size={12} />} onClick={() => setRegForm(f => ({ ...f, queryParams: [...f.queryParams, { name: '', required: true, description: '' }] }))}>Add</Btn>
+              </div>
+              {regForm.queryParams.length > 0 && (
+                <div style={{ border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 44px 1fr 32px', fontSize: 10, fontWeight: 700, color: 'var(--txt-3)', textTransform: 'uppercase', letterSpacing: '0.5px', padding: '5px 10px', background: 'var(--surface-2)', borderBottom: '1px solid var(--border)', gap: 8 }}>
+                    <span>Key</span><span style={{ textAlign: 'center' }}>Req</span><span>Description</span><span />
+                  </div>
+                  {regForm.queryParams.map((qp, i) => (
+                    <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 44px 1fr 32px', alignItems: 'center', borderTop: i > 0 ? '1px solid var(--border)' : undefined, gap: 0 }}>
+                      <input
+                        className="pus-input"
+                        placeholder="paramName"
+                        value={qp.name}
+                        onChange={e => setRegForm(f => { const q = [...f.queryParams]; q[i] = { ...q[i], name: e.target.value }; return { ...f, queryParams: q } })}
+                        style={{ fontFamily: 'monospace', fontSize: 12, border: 'none', borderRadius: 0, borderRight: '1px solid var(--border)', outline: 'none', boxShadow: 'none', width: '100%', boxSizing: 'border-box' }}
+                      />
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', borderRight: '1px solid var(--border)', height: '100%' }}>
+                        <input type="checkbox" checked={qp.required} onChange={e => setRegForm(f => { const q = [...f.queryParams]; q[i] = { ...q[i], required: e.target.checked }; return { ...f, queryParams: q } })} style={{ cursor: 'pointer', accentColor: 'var(--accent)' }} />
+                      </div>
+                      <input
+                        className="pus-input"
+                        placeholder="Optional description"
+                        value={qp.description}
+                        onChange={e => setRegForm(f => { const q = [...f.queryParams]; q[i] = { ...q[i], description: e.target.value }; return { ...f, queryParams: q } })}
+                        style={{ fontSize: 11, border: 'none', borderRadius: 0, borderRight: '1px solid var(--border)', outline: 'none', boxShadow: 'none', width: '100%', boxSizing: 'border-box' }}
+                      />
+                      <button onClick={() => setRegForm(f => ({ ...f, queryParams: f.queryParams.filter((_, j) => j !== i) }))} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--txt-3)' }}>
+                        <X size={13} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {['POST', 'PUT', 'PATCH'].includes(regForm.httpMethod) && (
+              <div style={{ borderTop: `1px dashed var(--border)`, paddingTop: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <Field label="Body Mode" hint={regForm.bodyMode === 'PASSTHROUGH' ? 'Caller body is forwarded as-is to the upstream' : 'Upstream body is built from the template below'}>
+                  <div style={{ display: 'flex', gap: 0, borderRadius: 6, overflow: 'hidden', border: '1px solid var(--border)', width: 'fit-content' }}>
+                    {(['PASSTHROUGH', 'TEMPLATE'] as const).map(mode => (
+                      <button key={mode} type="button"
+                        onClick={() => setRegForm(f => ({ ...f, bodyMode: mode }))}
+                        style={{ padding: '5px 14px', fontSize: 11, fontWeight: 600, border: 'none', borderRight: mode === 'PASSTHROUGH' ? '1px solid var(--border)' : 'none', cursor: 'pointer', background: regForm.bodyMode === mode ? ACCENT : 'var(--surface-2)', color: regForm.bodyMode === mode ? '#fff' : 'var(--txt-2)', transition: 'all 0.15s' }}
+                      >{mode === 'PASSTHROUGH' ? 'Passthrough' : 'Template'}</button>
+                    ))}
+                  </div>
+                </Field>
+                {regForm.bodyMode === 'PASSTHROUGH' && (
+                  <Field label="Sample Payload" hint="Reference only — not sent to upstream. Documents the expected request body structure for this API.">
+                    <textarea className="pus-textarea" rows={6} value={regForm.samplePayload}
+                      onChange={e => setRegForm(f => ({ ...f, samplePayload: e.target.value }))}
+                      placeholder={'[\n  {\n    "field": "value"\n  }\n]'}
+                      style={{ fontFamily: 'monospace', fontSize: 12, width: '100%' }} />
+                  </Field>
+                )}
+                {regForm.bodyMode === 'TEMPLATE' && (
+                  <>
+                    <Field
+                      label={<span>Request Body Template <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--txt-3)' }}>— use <code style={{ background: 'var(--surface-2)', padding: '0 4px', borderRadius: 3 }}>{'{{param}}'}</code></span></span>}
+                      hint="Placeholders are substituted at request time from caller-supplied or auto-generated parameters"
+                    >
+                      <textarea className="pus-textarea" rows={5} value={regForm.requestBodyTemplate}
+                        onChange={e => setRegForm(f => ({ ...f, requestBodyTemplate: e.target.value }))}
+                        placeholder={'{\n  "txVersion": "1.1.0",\n  "txGuid": "{{$guid}}",\n  "vrn": "{{vrn}}",\n  "amount": {{amount}}\n}'}
+                        style={{ fontFamily: 'monospace', fontSize: 12, width: '100%' }} />
+                    </Field>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                      {['{{$guid}}', '{{$timestamp}}', '{{$isoDate}}'].map(b => (
+                        <code key={b} style={{ fontSize: 10, background: 'var(--surface-2)', padding: '2px 7px', borderRadius: 5, border: '1px solid var(--border)', color: 'var(--txt-2)', cursor: 'pointer' }}
+                          onClick={() => setRegForm(f => ({ ...f, requestBodyTemplate: (f.requestBodyTemplate || '') + b }))}
+                        >{b}</code>
+                      ))}
+                      <span style={{ fontSize: 10, color: 'var(--txt-3)', marginRight: 6 }}>click to insert</span>
+                      <button type="button"
+                        onClick={() => setRegForm(f => ({ ...f, requestBodyTemplate: templatizeJson(f.requestBodyTemplate) }))}
+                        style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, padding: '2px 8px', borderRadius: 5, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--txt-2)', cursor: 'pointer' }}
+                      >
+                        <Wand2 size={10} /> Auto-templatize values
+                      </button>
+                    </div>
+                  </>
+                )}
               </div>
             )}
           </div>
@@ -3086,16 +3581,121 @@ export default function ApiProxy() {
               hint="Full URL of the internal service this proxy will forward requests to"
               style={{ fontFamily: 'monospace' }}
             />
+
+            {/* Query Params */}
+            <div style={{ borderTop: '1px dashed var(--border)', paddingTop: 16 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--txt-1)', marginBottom: 2 }}>
+                    Query Params <span style={{ fontWeight: 400, color: 'var(--txt-3)', fontSize: 11 }}>— optional</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--txt-3)' }}>Parameters appended to the URL as <code style={{ fontFamily: 'monospace' }}>?key=value</code></div>
+                </div>
+                <Btn size="sm" icon={<Plus size={12} />} onClick={() => setEditForm(f => ({ ...f, queryParams: [...f.queryParams, { name: '', required: true, description: '' }] }))}>Add</Btn>
+              </div>
+              {editForm.queryParams.length > 0 && (
+                <div style={{ border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 44px 1fr 32px', fontSize: 10, fontWeight: 700, color: 'var(--txt-3)', textTransform: 'uppercase', letterSpacing: '0.5px', padding: '5px 10px', background: 'var(--surface-2)', borderBottom: '1px solid var(--border)', gap: 8 }}>
+                    <span>Key</span><span style={{ textAlign: 'center' }}>Req</span><span>Description</span><span />
+                  </div>
+                  {editForm.queryParams.map((qp, i) => (
+                    <div key={qp.id ?? i} style={{ display: 'grid', gridTemplateColumns: '1fr 44px 1fr 32px', alignItems: 'center', borderTop: i > 0 ? '1px solid var(--border)' : undefined, gap: 0 }}>
+                      <input
+                        className="pus-input"
+                        placeholder="paramName"
+                        value={qp.name}
+                        onChange={e => setEditForm(f => { const q = [...f.queryParams]; q[i] = { ...q[i], name: e.target.value }; return { ...f, queryParams: q } })}
+                        style={{ fontFamily: 'monospace', fontSize: 12, border: 'none', borderRadius: 0, borderRight: '1px solid var(--border)', outline: 'none', boxShadow: 'none', width: '100%', boxSizing: 'border-box' }}
+                      />
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', borderRight: '1px solid var(--border)', height: '100%' }}>
+                        <input type="checkbox" checked={qp.required} onChange={e => setEditForm(f => { const q = [...f.queryParams]; q[i] = { ...q[i], required: e.target.checked }; return { ...f, queryParams: q } })} style={{ cursor: 'pointer', accentColor: 'var(--accent)' }} />
+                      </div>
+                      <input
+                        className="pus-input"
+                        placeholder="Optional description"
+                        value={qp.description}
+                        onChange={e => setEditForm(f => { const q = [...f.queryParams]; q[i] = { ...q[i], description: e.target.value }; return { ...f, queryParams: q } })}
+                        style={{ fontSize: 11, border: 'none', borderRadius: 0, borderRight: '1px solid var(--border)', outline: 'none', boxShadow: 'none', width: '100%', boxSizing: 'border-box' }}
+                      />
+                      <button onClick={() => setEditForm(f => ({ ...f, queryParams: f.queryParams.filter((_, j) => j !== i) }))} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--txt-3)' }}>
+                        <X size={13} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
             {['POST', 'PUT', 'PATCH'].includes(editForm.httpMethod) && (
-              <Field
-                label={<span>Request Body Template <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--txt-3)' }}>— use <code style={{ background: 'var(--surface-2)', padding: '0 4px', borderRadius: 3 }}>{'{{paramName}}'}</code></span></span>}
-                hint="Placeholders are substituted at request time from caller-supplied or auto-generated parameters"
-              >
-                <textarea className="pus-textarea" rows={5} value={editForm.requestBodyTemplate}
-                  onChange={e => setEditForm(f => ({ ...f, requestBodyTemplate: e.target.value }))}
-                  placeholder={'{\n  "txGuid": "{{$guid}}",\n  "vrn": "{{vrn}}"\n}'}
-                  style={{ fontFamily: 'monospace', fontSize: 12, width: '100%' }} />
-              </Field>
+              <div>
+                <Field label="Body Mode" hint={editForm.bodyMode === 'PASSTHROUGH' ? 'Caller body is forwarded as-is to the upstream' : 'Upstream body is built from the template below'}>
+                  <div style={{ display: 'flex', gap: 0, borderRadius: 6, overflow: 'hidden', border: '1px solid var(--border)', width: 'fit-content' }}>
+                    {(['PASSTHROUGH', 'TEMPLATE'] as const).map(mode => (
+                      <button key={mode} type="button"
+                        onClick={() => setEditForm(f => ({ ...f, bodyMode: mode }))}
+                        style={{ padding: '5px 14px', fontSize: 11, fontWeight: 600, border: 'none', borderRight: mode === 'PASSTHROUGH' ? '1px solid var(--border)' : 'none', cursor: 'pointer', background: editForm.bodyMode === mode ? ACCENT : 'var(--surface-2)', color: editForm.bodyMode === mode ? '#fff' : 'var(--txt-2)', transition: 'all 0.15s' }}
+                      >{mode === 'PASSTHROUGH' ? 'Passthrough' : 'Template'}</button>
+                    ))}
+                  </div>
+                </Field>
+                {editForm.bodyMode === 'PASSTHROUGH' && (
+                  <Field label="Sample Payload" hint="Reference only — not sent to upstream. Documents the expected request body structure for this API.">
+                    <div style={{ position: 'relative' }}>
+                      <textarea className="pus-textarea" rows={6} value={editForm.samplePayload}
+                        onChange={e => setEditForm(f => ({ ...f, samplePayload: e.target.value }))}
+                        placeholder={'[\n  {\n    "field": "value"\n  }\n]'}
+                        style={{ fontFamily: 'monospace', fontSize: 12, width: '100%' }} />
+                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 4, marginTop: 4 }}>
+                        <button type="button" title="Copy"
+                          onClick={() => copyToClipboard(editForm.samplePayload)}
+                          style={{ display: 'flex', alignItems: 'center', padding: '3px 6px', borderRadius: 5, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--txt-3)', cursor: 'pointer' }}
+                        ><Copy size={11} /></button>
+                        <button type="button" title="Expand"
+                          onClick={() => setBodyModal({ title: 'Sample Payload', body: editForm.samplePayload })}
+                          style={{ display: 'flex', alignItems: 'center', padding: '3px 6px', borderRadius: 5, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--txt-3)', cursor: 'pointer' }}
+                        ><Maximize2 size={11} /></button>
+                      </div>
+                    </div>
+                  </Field>
+                )}
+                {editForm.bodyMode === 'TEMPLATE' && (
+                  <>
+                    <Field
+                      label={<span>Request Body Template <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--txt-3)' }}>— use <code style={{ background: 'var(--surface-2)', padding: '0 4px', borderRadius: 3 }}>{'{{paramName}}'}</code></span></span>}
+                      hint="Placeholders are substituted at request time from caller-supplied or auto-generated parameters"
+                    >
+                      <textarea className="pus-textarea" rows={5} value={editForm.requestBodyTemplate}
+                        onChange={e => setEditForm(f => ({ ...f, requestBodyTemplate: e.target.value }))}
+                        placeholder={'{\n  "txGuid": "{{$guid}}",\n  "vrn": "{{vrn}}"\n}'}
+                        style={{ fontFamily: 'monospace', fontSize: 12, width: '100%' }} />
+                    </Field>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6, alignItems: 'center' }}>
+                      {['{{$guid}}', '{{$timestamp}}', '{{$isoDate}}'].map(b => (
+                        <code key={b} style={{ fontSize: 10, background: 'var(--surface-2)', padding: '2px 7px', borderRadius: 5, border: '1px solid var(--border)', color: 'var(--txt-2)', cursor: 'pointer' }}
+                          onClick={() => setEditForm(f => ({ ...f, requestBodyTemplate: (f.requestBodyTemplate || '') + b }))}
+                        >{b}</code>
+                      ))}
+                      <span style={{ fontSize: 10, color: 'var(--txt-3)', marginRight: 6 }}>click to insert</span>
+                      <button type="button"
+                        onClick={() => setEditForm(f => ({ ...f, requestBodyTemplate: templatizeJson(f.requestBodyTemplate) }))}
+                        style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, padding: '2px 8px', borderRadius: 5, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--txt-2)', cursor: 'pointer' }}
+                      >
+                        <Wand2 size={10} /> Auto-templatize values
+                      </button>
+                      <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
+                        <button type="button" title="Copy template"
+                          onClick={() => copyToClipboard(editForm.requestBodyTemplate)}
+                          style={{ display: 'flex', alignItems: 'center', padding: '3px 6px', borderRadius: 5, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--txt-3)', cursor: 'pointer' }}
+                        ><Copy size={11} /></button>
+                        <button type="button" title="Expand editor"
+                          onClick={() => setTemplateEditorOpen(true)}
+                          style={{ display: 'flex', alignItems: 'center', padding: '3px 6px', borderRadius: 5, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--txt-3)', cursor: 'pointer' }}
+                        ><Maximize2 size={11} /></button>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
             )}
           </div>
         )}
@@ -3287,6 +3887,26 @@ export default function ApiProxy() {
       </Modal>
 
       {/* ── Body viewer modal ───────────────────────────────────────────── */}
+      <Modal open={templateEditorOpen} onClose={() => setTemplateEditorOpen(false)} title="Request Body Template" width={820}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6 }}>
+            <button type="button"
+              onClick={() => setEditForm(f => ({ ...f, requestBodyTemplate: templatizeJson(f.requestBodyTemplate) }))}
+              style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, padding: '4px 10px', borderRadius: 5, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--txt-2)', cursor: 'pointer' }}
+            ><Wand2 size={11} /> Auto-templatize values</button>
+            <button type="button"
+              onClick={() => copyToClipboard(editForm.requestBodyTemplate)}
+              style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, padding: '4px 10px', borderRadius: 5, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--txt-2)', cursor: 'pointer' }}
+            ><Copy size={11} /> Copy</button>
+          </div>
+          <textarea className="pus-textarea"
+            value={editForm.requestBodyTemplate}
+            onChange={e => setEditForm(f => ({ ...f, requestBodyTemplate: e.target.value }))}
+            style={{ fontFamily: 'monospace', fontSize: 12, width: '100%', minHeight: 480, resize: 'vertical', boxSizing: 'border-box' }}
+          />
+        </div>
+      </Modal>
+
       <Modal open={!!bodyModal} onClose={() => setBodyModal(null)} title={bodyModal?.title ?? ''} width={760}>
         {bodyModal && (() => {
           let pretty = bodyModal.body
@@ -3312,6 +3932,7 @@ export default function ApiProxy() {
         })()}
       </Modal>
 
+      {/* ── SMS Token Modal ──────────────────────────────────────────────────── */}
     </div>
   )
 }

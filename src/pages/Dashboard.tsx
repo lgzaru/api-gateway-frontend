@@ -10,7 +10,7 @@ import { useAuth }     from '../context/AuthContext'
 import { useTheme }    from '../context/ThemeContext'
 import { listApis, getHealthSummary } from '../api/proxy'
 import { getDashboardMetrics, type ApiMetrics } from '../api/governance'
-import { listPartners }               from '../api/partners'
+import { listPartners, getPendingIpRequests } from '../api/partners'
 import { listPending, type Approval } from '../api/approvals'
 import { listAuditLogs, type AuditLogEntry } from '../api/audit'
 import { listUsers }                  from '../api/users'
@@ -561,8 +561,14 @@ export default function Dashboard() {
     queryFn:  () => listPending({ page: 0, size: 4 }),
     select:   r  => r.data,
   })
-  const pendingCount = approvalsPage?.totalElements ?? 0
+  const { data: pendingIpPage } = useQuery({
+    queryKey: ['dash-pending-ip'], staleTime: 30_000,
+    queryFn:  () => getPendingIpRequests({ page: 0, size: 4 }),
+    select:   r  => r.data,
+  })
+  const pendingCount = (approvalsPage?.totalElements ?? 0) + (pendingIpPage?.totalElements ?? 0)
   const pendingItems = approvalsPage?.content ?? []
+  const pendingIpItems = pendingIpPage?.content ?? []
 
   const { data: auditPage } = useQuery({
     queryKey: ['dash-audit'], staleTime: 30_000,
@@ -712,7 +718,7 @@ export default function Dashboard() {
                 color="#f59e0b"
                 right={pendingCount > 0 ? <span style={{ color: '#f59e0b', fontWeight: 700, fontSize: 11 }}>{pendingCount}</span> : undefined}
               />
-              {pendingItems.length === 0 ? (
+              {pendingItems.length === 0 && pendingIpItems.length === 0 ? (
                 <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
                   <CheckCircle2 size={20} color="#10b981" style={{ opacity: 0.7 }} />
                   <span style={{ fontSize: 11, color: 'var(--txt-3)', textAlign: 'center' }}>No pending approvals</span>
@@ -725,6 +731,14 @@ export default function Dashboard() {
                         {item.actionType.replace(/_/g, ' ')}
                       </div>
                       <div style={{ fontSize: 10, color: 'var(--txt-3)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.requestedBy}</div>
+                    </div>
+                  ))}
+                  {pendingIpItems.map((item) => (
+                    <div key={item.id} style={{ padding: '6px 8px', background: '#f59e0b08', border: '1px solid #f59e0b20', borderRadius: 7 }}>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--txt-1)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', marginBottom: 2 }}>
+                        IP {item.action} — {item.ipCidr}
+                      </div>
+                      <div style={{ fontSize: 10, color: 'var(--txt-3)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.reason || (item.requestedBy ? `${item.requestedBy.slice(0, 8)}…` : '—')}</div>
                     </div>
                   ))}
                 </div>

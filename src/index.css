@@ -444,7 +444,7 @@ input, select, textarea {
   inset: 0;
   background: rgba(0,0,0,0.45);
   backdrop-filter: blur(3px);
-  z-index: 1000;
+  z-index: 1200;
   animation: fade-in var(--dur-normal) both;
   display: flex;
   align-items: center;

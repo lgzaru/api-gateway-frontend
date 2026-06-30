@@ -1,12 +1,12 @@
 import { useState, useEffect, useRef, type ReactNode } from 'react'
 import { Outlet, useNavigate, useLocation } from 'react-router-dom'
 import {
-  LayoutDashboard, Zap, Database, BookOpen, Users, MessageSquare,
-  Bell, Link2, Monitor, AlertCircle, Globe, Flag, CreditCard,
+  LayoutDashboard, Zap, Users, MessageSquare,
+  Bell, Link2, CreditCard,
   FileText, User, ClipboardList, PanelLeftClose, PanelLeftOpen,
   LogOut, Settings, Sun, Moon, ChevronRight,
-  Home, Cloud, BellRing, AlertTriangle, Shield,
-  Wallet, Wrench, GitBranch, PlayCircle, PackageSearch, SlidersHorizontal,
+  Home, Cloud, BellRing, Shield,
+  Wallet, Wrench, SlidersHorizontal,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 import { useTheme } from '../context/ThemeContext'
@@ -32,12 +32,11 @@ const NAV: NavGroup[] = [
     // { key: '/testing',     label: 'API Testing',    icon: <PlayCircle size={14} />,   perm: 'TESTING:READ' },
     // { key: '/dependencies',label: 'Dependencies',   icon: <PackageSearch size={14} />,perm: 'DEPENDENCIES_READ' },
   ]},
-  // TODO: re-enable Communications when implemented
-  // { group: 'Communications', icon: <BellRing size={13} />, items: [
-  //   { key: '/sms',           label: 'SMS Gateway',   icon: <MessageSquare size={14} />, perm: 'SMS:READ' },
-  //   { key: '/notifications', label: 'Notifications', icon: <Bell size={14} />,          perm: 'NOTIFY:READ' },
-  //   { key: '/webhooks',      label: 'Webhooks',      icon: <Link2 size={14} />,         perm: 'WEBHOOK:READ' },
-  // ]},
+  { group: 'Communications', icon: <BellRing size={13} />, items: [
+    { key: '/sms',           label: 'SMS Gateway',   icon: <MessageSquare size={14} />, perm: 'SMS:READ' },
+    { key: '/notifications', label: 'Notifications', icon: <Bell size={14} />,          perm: 'NOTIFY:READ' },
+    { key: '/webhooks',      label: 'Webhooks',      icon: <Link2 size={14} />,         perm: 'WEBHOOK:READ' },
+  ]},
   // TODO: re-enable Monitoring when implemented
   // { group: 'Monitoring', icon: <AlertTriangle size={13} />, items: [
   //   { key: '/monitoring', label: 'Monitoring',  icon: <Monitor size={14} />,      perm: 'MONITOR:READ' },
@@ -49,11 +48,10 @@ const NAV: NavGroup[] = [
   //   { key: '/flags',      label: 'Feature Flags', icon: <Flag size={14} />,   perm: 'FLAG:READ' },
   //   { key: '/compliance', label: 'Compliance',    icon: <Shield size={14} />, perm: 'COMPLIANCE:READ' },
   // ]},
-  // TODO: re-enable Billing & Reports when implemented
-  // { group: 'Billing & Reports', icon: <Wallet size={13} />, items: [
-  //   { key: '/billing',   label: 'Billing',   icon: <CreditCard size={14} />, perm: 'BILLING:READ' },
-  //   { key: '/reporting', label: 'Reporting', icon: <FileText size={14} />,   perm: 'REPORT:READ' },
-  // ]},
+  { group: 'Billing & Reports', icon: <Wallet size={13} />, items: [
+    { key: '/billing',   label: 'Billing',   icon: <CreditCard size={14} />, perm: 'BILLING:READ' },
+    { key: '/reporting', label: 'Reporting', icon: <FileText size={14} />,   perm: 'REPORT:READ' },
+  ]},
   { group: 'Administration', icon: <Wrench size={13} />, items: [
     { key: '/users',            label: 'Users & Roles',      icon: <User size={14} />,                perm: 'USER:READ' },
     { key: '/audit',            label: 'Audit Log',          icon: <ClipboardList size={14} />,       perm: 'AUDIT:READ' },
